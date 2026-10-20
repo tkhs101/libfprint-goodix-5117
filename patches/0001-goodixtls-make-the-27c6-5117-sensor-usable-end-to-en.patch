@@ -1,0 +1,1041 @@
+From 0365f136ceb5aaa78dc4bfd1b77468c520362e53 Mon Sep 17 00:00:00 2001
+From: tkhs101 <tkhs101@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:33:14 +0900
+Subject: [PATCH] goodixtls: make the 27c6:5117 sensor usable end to end
+
+Tested on an Honor MagicBook Pro 2020 (HLYL-WXX9) running firmware
+GF_ST411SEC_APP_12118.
+
+TLS transport:
+- Port goodixtls.c from OpenSSL to GnuTLS. The GF511 sensors send a
+  ClientHello without extensions, which OpenSSL rejects while GnuTLS
+  accepts it. Restrict the priority to TLS 1.2 with PSK key exchange and
+  AES-128-GCM, the only real suite the sensor offers (0x00a8).
+- Read the TLS session key from /etc/goodix5117/psk (or $GOODIX_PSK_FILE)
+  when present, falling back to the all-zero factory key. The 32 bytes
+  returned by PRESET_PSK_READ (0xe4) are a digest of the white-box blob
+  the Windows driver writes, not the TLS key.
+- Feed each TLS record to the engine exactly once; calling
+  gnutls_handshake() from two places fed the same record twice and made
+  every step fail with "unexpected TLS handshake packet".
+- Ignore the stray 0xd0 (request-TLS) packet that arrives around the
+  handshake instead of failing the state machine on it.
+
+Activation:
+- Bring the TLS session up before the activation sequence. On 12118 the
+  sensor boots straight into its TLS transport and only answers 0xae and
+  0xd0 in clear text; everything else times out.
+- Raise the image-capture timeout to 10s: the capture blocks until a
+  finger is placed, so the 1s command budget is far too short.
+- Accept any GF_ST411SEC_APP_* build; units ship different versions of
+  the same firmware family.
+- Warn instead of failing when the reported PSK digest differs from the
+  factory value.
+- Add an optional per-FDT-command MCU config hook.
+
+Matching:
+- Report finger-off right after a successful capture for non-enrol
+  actions. Waiting for FTD_UP left the action pending until fprintd
+  cancelled it, so a successful match was reported as verify-no-match.
+- Do not report an error when the current action is already gone.
+
+Debugging (environment-gated, no effect by default):
+- GOODIX_DUMP_DIR dumps every captured frame as PGM.
+- Log the residual dynamic range after calibration.
+---
+ libfprint/drivers/goodixtls/goodix.c    |  40 ++-
+ libfprint/drivers/goodixtls/goodix.h    |   3 +
+ libfprint/drivers/goodixtls/goodix511.c | 119 +++++++-
+ libfprint/drivers/goodixtls/goodix511.h |  23 +-
+ libfprint/drivers/goodixtls/goodix5xx.c | 107 ++++++-
+ libfprint/drivers/goodixtls/goodix5xx.h |   9 +
+ libfprint/drivers/goodixtls/goodixtls.c | 354 ++++++++++++++++--------
+ libfprint/drivers/goodixtls/goodixtls.h |  16 +-
+ meson.build                             |  16 +-
+ 9 files changed, 516 insertions(+), 171 deletions(-)
+
+diff --git a/libfprint/drivers/goodixtls/goodix.c b/libfprint/drivers/goodixtls/goodix.c
+index 236589f..b6819d1 100644
+--- a/libfprint/drivers/goodixtls/goodix.c
++++ b/libfprint/drivers/goodixtls/goodix.c
+@@ -26,8 +26,6 @@
+ #include <gio/gio.h>
+ #include <glib.h>
+ #include <gusb.h>
+-#include <openssl/ssl.h>
+-#include <pthread.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -351,7 +349,12 @@ goodix_receive_protocol (FpDevice *dev, guint8 *data, guint32 length)
+ 
+   if (priv->cmd != cmd)
+     {
+-      fp_warn ("Invalid protocol command: 0x%02x", cmd);
++      /* LOCAL PATCH: the sensor emits a stray 0xd0 (request-TLS) data packet
++       * around the handshake. Treating it as an error wedged the state machine
++       * and every later command timed out. Log it and keep waiting for the
++       * packet we actually asked for. */
++      fp_dbg ("Ignoring unrelated protocol command: 0x%02x "
++              "(expected 0x%02x, len=%u)", cmd, priv->cmd, length);
+       return;
+     }
+ 
+@@ -399,10 +402,17 @@ goodix_receive_pack (FpDevice *dev, guint8 *data, guint32 length)
+ 
+     case GOODIX_FLAGS_TLS:
+       fp_dbg ("Got TLS msg");
++      /* LOCAL PATCH: records arriving after the first one used to go through
++       * goodix_receive_done(), which returns early once ack/reply are clear, so
++       * the record was silently dropped and the handshake stalled. Forward
++       * while a command is still waiting for TLS data (the handshake), and fall
++       * back to the original path otherwise so we never block the USB callback
++       * on a full socket buffer. */
++      /* LOCAL PATCH: hand the record to the TLS engine exactly once and let
++       * the handshake / read helpers decide what to do with it. Calling
++       * gnutls_handshake() from two places fed the same record twice and made
++       * every step fail with "unexpected TLS handshake packet". */
+       goodix_receive_done (dev, payload, payload_len, NULL);
+-
+-      // TLS message sending it to TLS server.
+-      // TODO
+       break;
+ 
+     default:
+@@ -630,15 +640,18 @@ goodix_send_mcu_get_image (FpDevice *dev, GoodixImageCallback callback,
+       cb_info->callback = G_CALLBACK (callback);
+       cb_info->user_data = user_data;
+ 
++      /* LOCAL PATCH: image capture blocks until the finger is placed, so the
++       * 1s command timeout is far too short (the reference implementation
++       * waits 5s). */
+       goodix_send_protocol (dev, GOODIX_CMD_MCU_GET_IMAGE, (guint8 *) &payload,
+-                            sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+-                            goodix_receive_default, cb_info);
++                            sizeof (payload), NULL, TRUE, GOODIX_IMAGE_TIMEOUT,
++                            TRUE, goodix_receive_default, cb_info);
+       return;
+     }
+ 
+   goodix_send_protocol (dev, GOODIX_CMD_MCU_GET_IMAGE, (guint8 *) &payload,
+-                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+-                        NULL, NULL);
++                        sizeof (payload), NULL, TRUE, GOODIX_IMAGE_TIMEOUT,
++                        TRUE, NULL, NULL);
+ }
+ 
+ void
+@@ -1459,11 +1472,16 @@ goodix_tls_ready_image_handler (FpDevice *dev, guint8 *data,
+ 
+   goodix_tls_client_write (priv->tls_hop, data, length);
+ 
+-  const guint16 size = -1;
++  /* LOCAL PATCH: the frame is a few KiB; asking for 0xffff bytes made
++   * gnutls_record_recv wait for data the sensor never sends. */
++  const guint16 size = 0x4000;
+   guint8 *buff = malloc (size);
+   GError *err = NULL;
+   int read_size = goodix_tls_server_read (priv->tls_hop, buff, size, &err);
+ 
++  if (read_size < 0 && err)
++    fp_warn ("TLS image read failed: %s", err->message);
++
+   if (read_size <= 0)
+     {
+       callback (dev, NULL, 0, cb_info->user_data, err);
+diff --git a/libfprint/drivers/goodixtls/goodix.h b/libfprint/drivers/goodixtls/goodix.h
+index 08bc254..aa33b55 100644
+--- a/libfprint/drivers/goodixtls/goodix.h
++++ b/libfprint/drivers/goodixtls/goodix.h
+@@ -24,6 +24,9 @@
+ 
+ // 1 seconds USB timeout
+ #define GOODIX_TIMEOUT (1000)
++/* LOCAL PATCH: image capture waits for the finger, so it needs a much longer
++ * budget than a normal command (reference driver uses 5s). */
++#define GOODIX_IMAGE_TIMEOUT (10000)
+ 
+ G_DECLARE_DERIVABLE_TYPE (FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
+                           DEVICE_GOODIXTLS, FpImageDevice)
+diff --git a/libfprint/drivers/goodixtls/goodix511.c b/libfprint/drivers/goodixtls/goodix511.c
+index d990ae1..21473ef 100644
+--- a/libfprint/drivers/goodixtls/goodix511.c
++++ b/libfprint/drivers/goodixtls/goodix511.c
+@@ -206,13 +206,38 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+     }
+ }
+ 
++static void activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error);
++
++/* LOCAL PATCH: on GF_ST411SEC_APP_12118 hardware the sensor boots straight
++ * into its TLS transport and only answers 0xae (query MCU state) and 0xd0
++ * (request TLS connection) in clear text. Everything else - enable_chip,
++ * firmware query, PSK read, reset, config upload - times out until the TLS
++ * session is up, so the stock order (activate commands, then TLS) can never
++ * complete. Bring the TLS session up first and run the activation sequence
++ * afterwards. */
++static void
++activate_after_tls (FpDevice *dev, gpointer user_data, GError *error)
++{
++  if (error)
++    {
++      fp_err ("failed to bring up TLS before activation: %s", error->message);
++      fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
++      return;
++    }
++
++  fp_dbg ("TLS established before activation, running activate sequence");
++  fpi_ssm_start (fpi_ssm_new (dev, activate_run_state, ACTIVATE_NUM_STATES),
++                 activate_complete);
++}
++
+ static void
+ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+   G_DEBUG_HERE ();
+   if (!error)
+     {
+-      goodixtls5xx_init_tls (dev);
++      /* TLS is already up (see activate_after_tls), so activation is done. */
++      fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), NULL);
+     }
+   else
+     {
+@@ -228,20 +253,45 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+ // ---- SCAN SECTION START ----
+ 
++/* LOCAL PATCH: every FDT command needs its own register sequence, and each
++ * carries a leading length byte. The stock driver reused a single table (with
++ * no length byte and different values) for 0x32/0x34/0x36, so the sensor never
++ * entered a mode where MCU_GET_IMAGE (0x20) returns a frame. Values below are
++ * taken from the Goodix reference driver (goodix-fp-dump, driver_51x7.py) for
++ * GF_ST411SEC_APP_121xx parts. */
+ const guint8 fdt_switch_state_mode[] = {
++  0x0d,
+   0x01,
+-  0x80,
+-  0xaf,
+-  0x80,
+-  0xbf,
+-  0x80,
+-  0xa4,
+-  0x80,
+-  0xb8,
+-  0x80,
+-  0xa8,
+-  0x80,
+-  0xb7,
++  0x80, 0xb0,
++  0x80, 0xc0,
++  0x80, 0xa4,
++  0x80, 0xb4,
++  0x80, 0xa3,
++  0x80, 0xb4,
++};
++
++/* 0x34 mcu_switch_to_fdt_up */
++const guint8 fdt_up_mode[] = {
++  0x0e,
++  0x01,
++  0x80, 0x90,
++  0x80, 0x9a,
++  0x80, 0x7b,
++  0x80, 0x95,
++  0x80, 0x8c,
++  0x80, 0xa3,
++};
++
++/* 0x32 mcu_switch_to_fdt_down (armed for capture, waits for the finger) */
++const guint8 fdt_down_mode[] = {
++  0x0c,
++  0x01,
++  0x80, 0xb2,
++  0x80, 0xc2,
++  0x80, 0xa7,
++  0x80, 0xb6,
++  0x80, 0xa6,
++  0x80, 0xb6,
+ };
+ 
+ 
+@@ -254,8 +304,13 @@ dev_activate (FpImageDevice *img_dev)
+ {
+   FpDevice *dev = FP_DEVICE (img_dev);
+ 
+-  fpi_ssm_start (fpi_ssm_new (dev, activate_run_state, ACTIVATE_NUM_STATES),
+-                 activate_complete);
++  /* LOCAL PATCH: this firmware family needs the TLS session before it will
++   * accept any clear-text command other than 0xae/0xd0.
++   * The USB read loop is normally started by ACTIVATE_READ_AND_NOP, which now
++   * runs after the handshake, so start it here first - otherwise the device's
++   * TLS records are never picked up and the handshake stalls forever. */
++  goodix_start_read_loop (dev);
++  goodix_tls_init (dev, activate_after_tls, NULL);
+ }
+ 
+ 
+@@ -276,6 +331,39 @@ get_mcu_config ()
+   return cfg;
+ }
+ 
++/* LOCAL PATCH: pick the register sequence that belongs to the command being
++ * sent. The sensor latches its capture mode from these bytes, so sending the
++ * fdt_mode sequence for an up/down switch silently leaves it unable to produce
++ * a frame. */
++static GoodixTls5xxMcuConfig
++get_mcu_config_for_mode (FpDevice *dev,
++                         void (*mode_switch)(FpDevice *, const guint8 *, guint16,
++                                             GDestroyNotify,
++                                             GoodixDefaultCallback, gpointer))
++{
++  GoodixTls5xxMcuConfig cfg;
++
++  cfg.free_fn = NULL;
++
++  if (mode_switch == goodix_send_mcu_switch_to_fdt_up)
++    {
++      cfg.data = fdt_up_mode;
++      cfg.data_len = sizeof (fdt_up_mode);
++    }
++  else if (mode_switch == goodix_send_mcu_switch_to_fdt_down)
++    {
++      cfg.data = fdt_down_mode;
++      cfg.data_len = sizeof (fdt_down_mode);
++    }
++  else
++    {
++      cfg.data = fdt_switch_state_mode;
++      cfg.data_len = sizeof (fdt_switch_state_mode);
++    }
++
++  return cfg;
++}
++
+ static FpImage *
+ crop_frame (guint8 * frame)
+ {
+@@ -302,6 +390,7 @@ fpi_device_goodixtls511_class_init (FpiDeviceGoodixTls511Class * class)
+   FpiDeviceGoodixTls5xxClass * xx_cls = FPI_DEVICE_GOODIXTLS5XX_CLASS (class);
+ 
+   xx_cls->get_mcu_cfg = get_mcu_config;
++  xx_cls->get_mcu_cfg_for_mode = get_mcu_config_for_mode;
+   xx_cls->process_frame = crop_frame;
+   xx_cls->scan_height = GOODIX511_HEIGHT;
+   xx_cls->scan_width = GOODIX511_SCAN_WIDTH;
+diff --git a/libfprint/drivers/goodixtls/goodix511.h b/libfprint/drivers/goodixtls/goodix511.h
+index 758e968..4a3a2b5 100644
+--- a/libfprint/drivers/goodixtls/goodix511.h
++++ b/libfprint/drivers/goodixtls/goodix511.h
+@@ -20,20 +20,35 @@
+ 
+ #pragma once
+ 
+-#define GOODIX_511_INTERFACE (0)
++/* LOCAL PATCH: this 27c6:5117 unit exposes a split USB layout — interface 0
++ * carries only the IN interrupt endpoint (0x82), while the bulk data pair
++ * (OUT 0x01 / IN 0x81) lives on interface 1. The stock driver assumed a single
++ * interface holding both, so every command was sent to the wrong interface and
++ * timed out ("did not claim interface 1 before use"). */
++#define GOODIX_511_INTERFACE (1)
+ #define GOODIX_511_EP_IN (0x1 | FPI_USB_ENDPOINT_IN)
+ #define GOODIX_511_EP_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
+ 
+ #define GOODIX_511_FIRMWARE_VERSION ("GF_ST411SEC_APP_12109")
++/* LOCAL PATCH: accept the whole GF_ST411SEC_APP_ 511 family (e.g. 12118)
++ * instead of only the 12109 build this driver was developed against. */
++#define GOODIX_511_FIRMWARE_PREFIX ("GF_ST411SEC_APP_")
+ 
+ #define GOODIX_511_PSK_FLAGS (0xbb020003)
+ 
+ #define GOODIX_511_RESET_NUMBER (2048)
+ 
++/* Factory value reported by PRESET_PSK_READ. It is a digest of the
++ * white-box blob the Windows driver stored, not the TLS key. A sensor
++ * that has been re-provisioned by Windows reports something else, so the
++ * comparison in goodixtls5xx_check_preset_psk_read() is a warning only.
++ *
++ * The TLS key itself lives in /etc/goodix5117/psk when the sensor has a
++ * per-device key; it is all zeroes for a factory-provisioned sensor. */
+ const guint8 goodix_511_psk_0[] = {
+-  0xba, 0x1a, 0x86, 0x03, 0x7c, 0x1d, 0x3c, 0x71, 0xc3, 0xaf, 0x34,
+-  0x49, 0x55, 0xbd, 0x69, 0xa9, 0xa9, 0x86, 0x1d, 0x9e, 0x91, 0x1f,
+-  0xa2, 0x49, 0x85, 0xb6, 0x77, 0xe8, 0xdb, 0xd7, 0x2d, 0x43};
++  0xba, 0x1a, 0x86, 0x03, 0x7c, 0x1d, 0x3c, 0x71, 0xc3, 0xaf, 0x34, 0x49,
++  0x55, 0xbd, 0x69, 0xa9, 0xa9, 0x86, 0x1d, 0x9e, 0x91, 0x1f, 0xa2, 0x49,
++  0x85, 0xb6, 0x77, 0xe8, 0xdb, 0xd7, 0x2d, 0x43};
+ 
+ guint8 goodix_511_config[] = {
+   0x70, 0x11, 0x60, 0x71, 0x2c, 0x9d, 0x2c, 0xc9, 0x1c, 0xe5, 0x18, 0xfd,
+diff --git a/libfprint/drivers/goodixtls/goodix5xx.c b/libfprint/drivers/goodixtls/goodix5xx.c
+index a75d28b..1854872 100644
+--- a/libfprint/drivers/goodixtls/goodix5xx.c
++++ b/libfprint/drivers/goodixtls/goodix5xx.c
+@@ -65,6 +65,11 @@ send_switch_mode (FpDevice * dev, gpointer ssm, void (*mode_switch)(FpDevice *,
+   FpiDeviceGoodixTls5xxClass *cls = FPI_DEVICE_GOODIXTLS5XX_GET_CLASS (dev);
+   GoodixTls5xxMcuConfig cfg = cls->get_mcu_cfg ();
+ 
++  /* LOCAL PATCH: some parts need a distinct register sequence per FDT command
++   * (up / down / mode) rather than one shared table. Optional class hook. */
++  if (cls->get_mcu_cfg_for_mode)
++    cfg = cls->get_mcu_cfg_for_mode (FP_DEVICE (dev), mode_switch);
++
+   mode_switch (dev, cfg.data, cfg.data_len, cfg.free_fn, goodixtls5xx_check_none_cmd, ssm);
+ }
+ static void on_calibrate_scan(FpDevice* dev, guint8* data, guint16 len, gpointer ssm, GError* err) {
+@@ -139,10 +144,26 @@ goodixtls5xx_check_firmware_version (FpDevice *dev, gchar *firmware,
+ 
+   if (strcmp (firmware, cls->firmware_version))
+     {
+-      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+-                   "Invalid device firmware: \"%s\"", firmware);
+-      fpi_ssm_mark_failed (user_data, error);
+-      return;
++      /* LOCAL PATCH: some units ship a different build of the same firmware
++       * family (e.g. GF_ST411SEC_APP_12118 instead of _12109). Accept any
++       * build sharing the family prefix before the trailing version number,
++       * but warn so mismatches remain visible in the logs. */
++      const char *sep = strrchr (cls->firmware_version, '_');
++      size_t prefix_len = sep ? (size_t) (sep - cls->firmware_version + 1) : 0;
++
++      if (prefix_len > 0 && !strncmp (firmware, cls->firmware_version, prefix_len))
++        {
++          fp_warn ("Firmware \"%s\" differs from the expected \"%s\"; "
++                   "continuing with the same firmware family.",
++                   firmware, cls->firmware_version);
++        }
++      else
++        {
++          g_set_error (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                       "Invalid device firmware: \"%s\"", firmware);
++          fpi_ssm_mark_failed (user_data, error);
++          return;
++        }
+     }
+ 
+   fpi_ssm_next_state (user_data);
+@@ -193,10 +214,12 @@ goodixtls5xx_check_preset_psk_read (FpDevice *dev, gboolean success,
+ 
+   if (memcmp (psk, cls->psk, cls->psk_len))
+     {
+-      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+-                   "Invalid device PSK: 0x%s", psk_str);
+-      fpi_ssm_mark_failed (user_data, error);
+-      return;
++      /* The sensor reports the digest of the white-box blob the Windows
++       * driver wrote, which is different for every device and changes
++       * whenever Windows re-provisions it. It is not the TLS key, so a
++       * mismatch must not stop the activation: the real key is checked
++       * during the handshake. */
++      fp_warn ("Device PSK differs from the factory value: 0x%s", psk_str);
+     }
+ 
+   fpi_ssm_next_state (user_data);
+@@ -334,14 +357,74 @@ scan_on_read_img (FpDevice *dev, guint8 *data, guint16 len,
+   GoodixTls5xxPix * raw_frame = calloc (cls->scan_width * cls->scan_height, sizeof (GoodixTls5xxPix));
+   goodixtls5xx_decode_frame (raw_frame, len, data);
+   linear_subtract_inplace(raw_frame, priv->calibration_img, cls->scan_width * cls->scan_height);
++
++  /* Debug helper: the dynamic range of the background-subtracted frame shows
++   * whether the subtraction actually worked. A small span means the
++   * calibration frame no longer describes the current sensor state (e.g.
++   * temperature drift between activation and scan), which flattens the
++   * ridges and makes the minutiae extraction fail completely. */
++  {
++    const guint n = cls->scan_width * cls->scan_height;
++    GoodixTls5xxPix rmin = 0xffff, rmax = 0;
++    for (guint i = 0; i < n; i++)
++      {
++        if (raw_frame[i] < rmin) rmin = raw_frame[i];
++        if (raw_frame[i] > rmax) rmax = raw_frame[i];
++      }
++    fp_dbg ("residual range after calibration: %u..%u (span %u)", rmin, rmax, rmax - rmin);
++  }
++
+   guint8 * squashed = calloc (cls->scan_height * cls->scan_width, 1);
+   goodixtls5xx_squash_frame_linear (raw_frame, squashed, cls->scan_height * cls->scan_width);
+   free (raw_frame);
+   FpImage * img = cls->process_frame (squashed);
+   free(squashed);
+ 
++  /* Debug helper: dump the frame the matcher actually sees, so that frames
++   * captured with a good and with a bad finger placement can be compared.
++   * Set GOODIX_DUMP_DIR=/some/dir to enable it. */
++  {
++    const char *dump_dir = g_getenv ("GOODIX_DUMP_DIR");
++    if (dump_dir)
++      {
++        gint64 ts;
++        char *path;
++
++        ts = g_get_real_time ();
++        path = g_strdup_printf ("%s/goodix-%" G_GINT64_FORMAT ".pgm", dump_dir, ts);
++        if (goodixtls5xx_save_image_to_pgm (img, path))
++          fp_dbg ("dumped image to %s", path);
++        else
++          g_warning ("failed to dump image to %s", path);
++        g_free (path);
++      }
++  }
++
+   fpi_image_device_image_captured (img_dev, img);
+ 
++  if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL)
++    {
++      /* The core only deactivates the device - and therefore only completes
++       * the action - once we report finger-off, see
++       * fpi_image_device_report_finger_status().
++       *
++       * Waiting for the FTD_UP command here does not work: that command only
++       * completes once the finger is physically lifted, so the action stays
++       * pending until fprintd cancels it, and a successful match ends up
++       * reported as "verify-no-match" (the "Idle cancelling on ongoing
++       * operation!" path in fp-device.c).
++       *
++       * Upstream image drivers report finger-off right after the capture as
++       * well, see aes3k.c, egis0570.c and upektc_img.c.
++       *
++       * Stop the state machine first so that we do not issue any further
++       * commands to the device; the deactivation below resets it anyway.
++       */
++      fpi_ssm_mark_completed (ssm);
++      fpi_image_device_report_finger_status (img_dev, FALSE);
++      return;
++    }
++
+   fpi_ssm_next_state (ssm);
+ }
+ 
+@@ -408,6 +491,13 @@ scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+   if (error)
+     {
+       fp_err ("failed to scan: %s (code: %d)", error->message, error->code);
++
++      /* If the action is already gone there is nothing left to report; the
++       * device was deactivated on purpose (e.g. after a successful capture)
++       * and reporting an error now would only produce a bogus warning. */
++      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_NONE)
++        return;
++
+       fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
+       return;
+     }
+@@ -550,6 +640,7 @@ void
+ fpi_device_goodixtls5xx_class_init (FpiDeviceGoodixTls5xxClass * self)
+ {
+   self->get_mcu_cfg = NULL;
++  self->get_mcu_cfg_for_mode = NULL;
+   self->process_frame = NULL;
+   self->scan_height = 0;
+   self->scan_width = 0;
+diff --git a/libfprint/drivers/goodixtls/goodix5xx.h b/libfprint/drivers/goodixtls/goodix5xx.h
+index 855996e..e0bff7a 100644
+--- a/libfprint/drivers/goodixtls/goodix5xx.h
++++ b/libfprint/drivers/goodixtls/goodix5xx.h
+@@ -62,6 +62,12 @@ typedef struct
+ 
+ typedef FpImage *(*GoodixTls5xxProcessFrameFn)(guint8 * pix);
+ typedef GoodixTls5xxMcuConfig (*GoodixTls5xxGetMcuFn)(void);
++/* Optional: per-command MCU config. Receives the switch callback so the driver
++ * can tell fdt_up / fdt_down / fdt_mode apart. */
++typedef GoodixTls5xxMcuConfig (*GoodixTls5xxGetMcuForModeFn)(
++    FpDevice *,
++    void (*mode_switch)(FpDevice *, const guint8 *, guint16, GDestroyNotify,
++                        GoodixDefaultCallback, gpointer));
+ typedef void (*GoodixTls5xxResetStateFn)(FpDevice *);
+ 
+ struct _FpiDeviceGoodixTls5xxClass
+@@ -69,6 +75,9 @@ struct _FpiDeviceGoodixTls5xxClass
+   FpiDeviceGoodixTlsClass    parent;
+ 
+   GoodixTls5xxGetMcuFn       get_mcu_cfg; ///< provide the mcu config before fdt commands
++
++  /// optional, per-command variant of get_mcu_cfg (takes precedence when set)
++  GoodixTls5xxGetMcuForModeFn get_mcu_cfg_for_mode;
+   GoodixTls5xxProcessFrameFn process_frame; ///< process a frame after it is decoded (e.g. crop it)
+   GoodixTls5xxResetStateFn   reset_state; ///< callback to reset the state, may be NULL
+ 
+diff --git a/libfprint/drivers/goodixtls/goodixtls.c b/libfprint/drivers/goodixtls/goodixtls.c
+index 215ef53..87496a4 100644
+--- a/libfprint/drivers/goodixtls/goodixtls.c
++++ b/libfprint/drivers/goodixtls/goodixtls.c
+@@ -18,19 +18,24 @@
+ // License along with this library; if not, write to the Free Software
+ // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ 
++/* LOCAL PATCH: this file used to be an OpenSSL based TLS server.
++ *
++ * The GF_ST411SEC_APP_121xx sensors on 27c6:5117 send a trimmed down
++ * ClientHello that stops right after the compression_methods field - it
++ * carries no TLS extensions at all. OpenSSL refuses such a ClientHello
++ * ("no shared cipher" / "length mismatch"), so the handshake could never
++ * complete and every later command timed out. GnuTLS accepts it, which is
++ * also what the known-good reference driver for these parts uses.
++ *
++ * The backend talks GnuTLS over an in-memory transport instead of a
++ * socketpair plus a serving thread, so no callback can block on a full pipe. */
++
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <glib.h>
++#include <gnutls/gnutls.h>
+ #include <netinet/in.h>
+-#include <openssl/crypto.h>
+-#include <openssl/err.h>
+-#include <openssl/ssl.h>
+-#include <openssl/tls1.h>
+-#include <poll.h>
+-#include <pthread.h>
+-#include <signal.h>
+ #include <string.h>
+-#include <sys/socket.h>
+ 
+ #include "drivers_api.h"
+ #include "fp-device.h"
+@@ -39,163 +44,280 @@
+ #include "goodix.h"
+ #include "goodixtls.h"
+ 
+-static GError *
+-err_from_ssl (void)
++/* TLS 1.2 with PSK key exchange only. The sensor offers exactly one real
++ * suite, PSK-AES256-GCM-SHA384 (0x00a8), plus the SCSV placeholder. */
++/* Matches the known-good reference driver ordering: DHE-PSK preferred, plain
++ * PSK as fallback. */
++/* The sensor offers exactly one real suite: 0x00a8
++ * (TLS_PSK_WITH_AES_128_GCM_SHA256). "NORMAL:+AES-128-GCM" still prefers
++ * AES-256 first, so restrict the cipher list explicitly. */
++#define GOODIX_TLS_PRIORITY \
++  "NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+PSK:-CIPHER-ALL:+AES-128-GCM"
++
++/* The sensor's TLS transport is keyed with an all-zero PSK. The 32 bytes read
++ * back with Preset PSK Read (0xe4) are an identity/provisioning token, not the
++ * TLS key, so they must not be fed to the handshake. */
++/* TLS session key. A factory-provisioned sensor uses 32 zero bytes; a
++ * sensor re-provisioned by the Windows driver uses a per-device key, which
++ * is read from /etc/goodix5117/psk (or $GOODIX_PSK_FILE) when present. */
++#define GOODIX_TLS_PSK_PATH "/etc/goodix5117/psk"
++
++static guint8 goodix_tls_psk[32] = { 0 };
++static gboolean goodix_tls_psk_loaded = FALSE;
++
++/* Loads the per-device key, if any. 64 hex digits, optionally followed by
++ * whitespace. Returns FALSE when no key file exists (all-zero key is then
++ * used, which is correct for a factory-provisioned sensor). */
++static gboolean
++goodix_tls_load_psk (void)
+ {
+-  GError *err = malloc (sizeof (GError));
+-  unsigned long code = ERR_get_error ();
++  const char *path = getenv ("GOODIX_PSK_FILE");
++  g_autofree gchar *contents = NULL;
++  gsize len = 0;
++  guint8 key[32];
++  gsize out = 0;
++  GError *error = NULL;
+ 
+-  err->code = code;
+-  const char *msg = ERR_reason_error_string (code);
++  if (goodix_tls_psk_loaded)
++    return TRUE;
+ 
+-  err->message = malloc (strlen (msg));
+-  strcpy (err->message, msg);
+-  return err;
+-}
++  if (path == NULL)
++    path = GOODIX_TLS_PSK_PATH;
+ 
+-static unsigned int
+-tls_server_psk_server_callback (SSL           *ssl,
+-                                const char    *identity,
+-                                unsigned char *psk,
+-                                unsigned int   max_psk_len)
+-{
+-  const int len = 32;
++  if (!g_file_get_contents (path, &contents, &len, &error))
++    {
++      fp_dbg ("No PSK file at %s, using the all-zero key", path);
++      goodix_tls_psk_loaded = TRUE;
++      return TRUE;
++    }
++
++  /* Two hex digits per byte, so the digit count must reach 2 * sizeof(key). */
++  for (gsize i = 0; i < len && out < sizeof (key) * 2; i++)
++    {
++      gchar c = contents[i];
++      guint8 v;
++
++      if (g_ascii_isxdigit (c))
++        v = g_ascii_xdigit_value (c);
++      else
++        continue;
++
++      if ((out & 1) == 0)
++        key[out / 2] = (v << 4);
++      else
++        key[out / 2] |= v;
++      out++;
++    }
+ 
+-  fp_dbg ("PSK WANTED %d", max_psk_len);
+-  if (len > max_psk_len)
++  if (out != sizeof (key) * 2)
+     {
+-      fp_err ("max psk length (%d) too short (needs %d)", max_psk_len, len);
+-      return 0;
++      fp_warn ("PSK file %s is malformed, using the all-zero key", path);
++      goto done;
+     }
+ 
+-  // zero out the psk
+-  for (int n = 0; n != len; ++n)
+-    psk[n] = 0;
++  memcpy (goodix_tls_psk, key, sizeof (key));
++  fp_dbg ("Loaded the per-device TLS key from %s", path);
+ 
+-  return len;
++done:
++  explicit_bzero (key, sizeof (key));
++  g_clear_pointer (&contents, g_free);
++  goodix_tls_psk_loaded = TRUE;
++  return TRUE;
+ }
+ 
+-static SSL_CTX *
+-tls_server_create_ctx (void)
++static GError *
++err_from_gnutls (int code)
+ {
+-  const SSL_METHOD *method;
++  return g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                      "gnutls: %s", gnutls_strerror (code));
++}
+ 
+-  method = TLS_server_method ();
++/* ---- transport callbacks ------------------------------------------------ */
+ 
+-  SSL_CTX *ctx = SSL_CTX_new (method);
++static ssize_t
++tls_pull (gnutls_transport_ptr_t ptr, void *data, size_t size)
++{
++  GoodixTlsServer *self = ptr;
+ 
+-  if (!ctx)
+-    return NULL;
++  if (!self->from_sensor || self->from_sensor->len == 0)
++    {
++      gnutls_transport_set_errno ((gnutls_session_t) self->session, EAGAIN);
++      return -1;
++    }
+ 
+-  return ctx;
+-}
++  size_t take = MIN (size, self->from_sensor->len);
+ 
+-static void
+-tls_server_config_ctx (SSL_CTX *ctx)
+-{
+-  SSL_CTX_set_ecdh_auto (ctx, 1);
+-  SSL_CTX_set_dh_auto (ctx, 1);
+-  SSL_CTX_set_cipher_list (ctx, "ALL");
+-  SSL_CTX_set_min_proto_version (ctx, TLS1_2_VERSION);
+-  SSL_CTX_set_max_proto_version (ctx, TLS1_2_VERSION);
+-  SSL_CTX_set_psk_server_callback (ctx, tls_server_psk_server_callback);
++  memcpy (data, self->from_sensor->data, take);
++  g_byte_array_remove_range (self->from_sensor, 0, take);
++
++  return (ssize_t) take;
+ }
+ 
+-int
+-goodix_tls_client_write (GoodixTlsServer *self, guint8 *data, guint16 length)
++static ssize_t
++tls_push (gnutls_transport_ptr_t ptr, const void *data, size_t size)
+ {
+-  return write (self->client_fd, data, length * sizeof (guint8));
++  GoodixTlsServer *self = ptr;
++
++  g_byte_array_append (self->to_sensor, data, size);
++  return (ssize_t) size;
+ }
+-int
+-goodix_tls_client_read (GoodixTlsServer *self, guint8 *data, guint16 length)
++
++/* ---- PSK ---------------------------------------------------------------- */
++
++static int
++tls_psk_server_cb (gnutls_session_t session, const char *username,
++                   gnutls_datum_t *key)
+ {
+-  return read (self->client_fd, data, length * sizeof (guint8));
++  fp_dbg ("PSK requested (identity: \"%s\")", username ? username : "(null)");
++
++  key->data = gnutls_malloc (sizeof (goodix_tls_psk));
++  if (!key->data)
++    return GNUTLS_E_MEMORY_ERROR;
++
++  memcpy (key->data, goodix_tls_psk, sizeof (goodix_tls_psk));
++  key->size = sizeof (goodix_tls_psk);
++  return 0;
+ }
+ 
+-int
+-goodix_tls_server_read (GoodixTlsServer *self, guint8 *data,
+-                        guint32 length, GError **error)
++/* ---- public API --------------------------------------------------------- */
++
++gboolean
++goodix_tls_server_init (GoodixTlsServer *self, GError **error)
+ {
+-  int retr = SSL_read (self->ssl_layer, data, length * sizeof (guint8));
++  gnutls_session_t session;
++  gnutls_psk_server_credentials_t creds;
++  int r;
+ 
+-  if (retr <= 0)
+-    *error = err_from_ssl ();
+-  return retr;
++  self->to_sensor = g_byte_array_new ();
++  self->from_sensor = g_byte_array_new ();
++
++  r = gnutls_psk_allocate_server_credentials (&creds);
++  if (r < 0)
++    {
++      g_propagate_error (error, err_from_gnutls (r));
++      return FALSE;
++    }
++
++  goodix_tls_load_psk ();
++
++  gnutls_psk_set_server_credentials_function (creds, tls_psk_server_cb);
++
++  r = gnutls_init (&session, GNUTLS_SERVER | GNUTLS_NONBLOCK);
++  if (r < 0)
++    {
++      gnutls_psk_free_server_credentials (creds);
++      g_propagate_error (error, err_from_gnutls (r));
++      return FALSE;
++    }
++
++  r = gnutls_priority_set_direct (session, GOODIX_TLS_PRIORITY, NULL);
++  if (r < 0)
++    {
++      gnutls_deinit (session);
++      gnutls_psk_free_server_credentials (creds);
++      g_propagate_error (error, err_from_gnutls (r));
++      return FALSE;
++    }
++
++  gnutls_credentials_set (session, GNUTLS_CRD_PSK, creds);
++  gnutls_transport_set_ptr (session, self);
++  gnutls_transport_set_pull_function (session, tls_pull);
++  gnutls_transport_set_push_function (session, tls_push);
++
++  self->session = session;
++  self->credentials = creds;
++
++  fp_dbg ("GnuTLS PSK server ready (TLS 1.2)");
++  return TRUE;
+ }
+ 
+-static void
+-tls_config_ssl (SSL *ssl)
++/* Feed a record received from the sensor into the TLS engine and advance the
++ * handshake as far as the buffered data allows. */
++int
++goodix_tls_client_write (GoodixTlsServer *self, guint8 *data, guint16 length)
+ {
+-  SSL_set_min_proto_version (ssl, TLS1_2_VERSION);
+-  SSL_set_max_proto_version (ssl, TLS1_2_VERSION);
+-  SSL_set_psk_server_callback (ssl, tls_server_psk_server_callback);
+-  SSL_set_cipher_list (ssl, "ALL");
++  if (!self->session || !data || length == 0)
++    return 0;
++
++  g_byte_array_append (self->from_sensor, data, length);
++
++  /* LOCAL PATCH: keep calling gnutls_handshake() until it either finishes,
++   * wants more input (GNUTLS_E_AGAIN) or fails. A single call per received
++   * record leaves the state machine part-way through and the peer's Finished
++   * record then fails to decrypt. */
++  int r;
++
++  do
++    r = gnutls_handshake ((gnutls_session_t) self->session);
++  while (r == GNUTLS_E_INTERRUPTED);
++
++  fp_dbg ("handshake step: r=%d (%s), to_sensor=%u B",
++          r, gnutls_strerror (r),
++          self->to_sensor ? self->to_sensor->len : 0);
++
++  if (r == 0)
++    fp_dbg ("TLS handshake complete (%s / %s)",
++            gnutls_protocol_get_name (
++              gnutls_protocol_get_version ((gnutls_session_t) self->session)),
++            gnutls_cipher_get_name (
++              gnutls_cipher_get ((gnutls_session_t) self->session)));
++  else if (r != GNUTLS_E_AGAIN && r != GNUTLS_E_INTERRUPTED)
++    fp_warn ("gnutls_handshake: %s", gnutls_strerror (r));
++
++  return length;
+ }
+ 
+-static void *
+-goodix_tls_init_serve (void *me)
++/* Return the bytes the sensor must send next (ServerHello and friends). */
++int
++goodix_tls_client_read (GoodixTlsServer *self, guint8 *data, guint16 length)
+ {
+-  GoodixTlsServer *self = me;
++  if (!self->to_sensor || self->to_sensor->len == 0)
++    return -1;
+ 
+-  fp_dbg ("TLS server waiting to accept...");
+-  int retr = SSL_accept (self->ssl_layer);
++  size_t take = MIN ((size_t) length, self->to_sensor->len);
+ 
+-  fp_dbg ("TLS server accept done");
+-  if (retr <= 0)
+-    fp_err ("server ready failed: %s", ERR_reason_error_string (ERR_get_error ()));
+-  else
+-    fp_dbg ("TLS connection ready");
+-  return NULL;
++  memcpy (data, self->to_sensor->data, take);
++  g_byte_array_remove_range (self->to_sensor, 0, take);
++
++  return (int) take;
+ }
+ 
+-gboolean
+-goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
++int
++goodix_tls_server_read (GoodixTlsServer *self, guint8 *data, guint32 length,
++                        GError **error)
+ {
+-  SSL_shutdown (self->ssl_layer);
+-  SSL_free (self->ssl_layer);
++  ssize_t r = gnutls_record_recv ((gnutls_session_t) self->session, data,
++                                  length);
+ 
+-  close (self->client_fd);
+-  close (self->sock_fd);
+-
+-  SSL_CTX_free (self->ssl_ctx);
+-  pthread_join (self->serve_thread, NULL);
++  if (r < 0 && r != GNUTLS_E_AGAIN && r != GNUTLS_E_INTERRUPTED)
++    {
++      if (error)
++        g_propagate_error (error, err_from_gnutls ((int) r));
++      return -1;
++    }
+ 
+-  return TRUE;
++  return (int) r;
+ }
+ 
+ gboolean
+-goodix_tls_server_init (GoodixTlsServer *self, GError **error)
++goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
+ {
+-  SSL_load_error_strings ();
+-  OpenSSL_add_ssl_algorithms ();
+-  SSL_library_init ();
+-  self->ssl_ctx = tls_server_create_ctx ();
+-  tls_server_config_ctx (self->ssl_ctx);
+-
+-  int socks[2] = {0, 0};
+-  if (socketpair (AF_UNIX, SOCK_STREAM, 0, socks) != 0)
++  if (self->session)
+     {
+-      g_set_error (error, G_FILE_ERROR, errno,
+-                   "failed to create socket pair: %s", strerror (errno));
+-      return FALSE;
++      gnutls_bye ((gnutls_session_t) self->session, GNUTLS_SHUT_WR);
++      gnutls_deinit ((gnutls_session_t) self->session);
++      self->session = NULL;
+     }
+-  self->sock_fd = socks[0];
+-  self->client_fd = socks[1];
+ 
+-  if (self->ssl_ctx == NULL)
++  if (self->credentials)
+     {
+-      fp_dbg ("Unable to create TLS server context\n");
+-      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "Unable to "
+-                                                                  "create TLS "
+-                                                                  "server "
+-                                                                  "context");
+-      return FALSE;
++      gnutls_psk_free_server_credentials (
++        (gnutls_psk_server_credentials_t) self->credentials);
++      self->credentials = NULL;
+     }
+-  self->ssl_layer = SSL_new (self->ssl_ctx);
+-  tls_config_ssl (self->ssl_layer);
+-  SSL_set_fd (self->ssl_layer, self->sock_fd);
+ 
+-  pthread_create (&self->serve_thread, 0, goodix_tls_init_serve, self);
++  g_clear_pointer (&self->to_sensor, g_byte_array_unref);
++  g_clear_pointer (&self->from_sensor, g_byte_array_unref);
+ 
+   return TRUE;
+ }
+diff --git a/libfprint/drivers/goodixtls/goodixtls.h b/libfprint/drivers/goodixtls/goodixtls.h
+index 80480a6..2c56a38 100644
+--- a/libfprint/drivers/goodixtls/goodixtls.h
++++ b/libfprint/drivers/goodixtls/goodixtls.h
+@@ -37,13 +37,15 @@ typedef struct _GoodixTlsServer
+ {
+   gpointer  user_data;  // Passed to all callbacks
+ 
+-  SSL_CTX  *ssl_ctx;
+-  SSL      *ssl_layer;
+-
+-  int       sock_fd;
+-  int       client_fd;
+-
+-  pthread_t serve_thread;
++  /* GnuTLS backend (see goodixtls.c for why OpenSSL cannot be used here). */
++  void     *session;        // gnutls_session_t
++  void     *credentials;    // gnutls_psk_server_credentials_t
++
++  /* In-memory transport between the TLS session and the sensor. Outbound
++   * bytes are the records the sensor must send; inbound bytes are the records
++   * the sensor produced. No sockets or threads are involved. */
++  GByteArray *to_sensor;
++  GByteArray *from_sensor;
+ } GoodixTlsServer;
+ 
+ /**
+diff --git a/meson.build b/meson.build
+index fa27507..e22c3e8 100644
+--- a/meson.build
++++ b/meson.build
+@@ -216,17 +216,13 @@ foreach i : driver_helpers
+         libfprint_conf.set10('HAVE_PIXMAN', true)
+         optional_deps += imaging_dep
+     elif i == 'goodixtls'
+-        openssl_dep = dependency('openssl', required: false)
+-        if not openssl_dep.found()
+-            error('openssl is required for @0@ and possibly others'.format(driver))
++        # LOCAL PATCH: GnuTLS instead of OpenSSL. The GF511 sensors send a
++        # ClientHello without extensions, which OpenSSL rejects.
++        gnutls_dep = dependency('gnutls', required: false)
++        if not gnutls_dep.found()
++            error('gnutls is required for @0@ and possibly others'.format(driver))
+         endif
+-        optional_deps += openssl_dep
+-
+-        threads_dep = dependency('threads', required: false)
+-        if not threads_dep.found()
+-            error('threads is required for @0@ and possibly others'.format(driver))
+-        endif
+-        optional_deps += threads_dep
++        optional_deps += gnutls_dep
+     elif i == 'nss'
+         nss_dep = dependency('nss', required: false)
+         if not nss_dep.found()
+-- 
+2.47.3
+

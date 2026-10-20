@@ -1,0 +1,23 @@
+#!/bin/bash
+# 把 fprintd dump 的原始帧 (PGM) 转成 PNG，方便对比不同按压角度的图像质量。
+# 用法: goodix-dump-view        转换 /tmp/goodix-dump 下所有帧
+#        goodix-dump-view 清理   删除所有帧
+set -u
+DIR="${GOODIX_DUMP_DIR:-/tmp/goodix-dump}"
+
+if [ "${1:-}" = "清理" ] || [ "${1:-}" = "clean" ]; then
+  rm -f "$DIR"/*.pgm "$DIR"/*.png 2>/dev/null
+  echo "已清空 $DIR"
+  exit 0
+fi
+
+shopt -s nullglob
+files=("$DIR"/*.pgm)
+[ ${#files[@]} -eq 0 ] && { echo "$DIR 下没有 PGM 帧（先跑一次 fprintd-verify）"; exit 0; }
+
+for f in "${files[@]}"; do
+  b="${f%.pgm}"
+  # -auto-level 做对比度拉伸，否则 8bit 量化后的脊线几乎看不见
+  convert "$f" -auto-level "${b}.png" 2>/dev/null && echo "${b}.png"
+done
+echo "共 ${#files[@]} 帧"
