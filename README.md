@@ -19,8 +19,10 @@ here fixes what that branch could not do on 12118 hardware.
 ```bash
 git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
 cd libfprint-1
-git am /path/to/patches/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch
-# then follow scripts/install.sh, or build manually (see below)
+git am /path/to/patches/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch \
+       /path/to/patches/0002-sigfm-do-not-require-doctest-to-build.patch
+# then run scripts/install.sh (Debian/Ubuntu) or scripts/install-fedora.sh,
+# or build manually (see below)
 ```
 
 ---
@@ -134,19 +136,67 @@ which is recoverable by re-running step 4.
 
 ## Build and install
 
+### Debian / Ubuntu
+
 ```bash
 sudo apt install build-essential meson ninja-build pkg-config \
     libglib2.0-dev libgusb-dev libcairo2-dev libgnutls28-dev \
-    libgudev-1.0-dev libnss3-dev libpixman-1-dev libgirepository1.0-dev
+    libgudev-1.0-dev libnss3-dev libpixman-1-dev libgirepository1.0-dev \
+    libopencv-dev
 ```
 
 ```bash
-meson setup build -Ddrivers=goodixtls -Dudev_rules=disabled -Dudev_hwdb=disabled
+git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
+cd libfprint-1
+git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch
+meson setup build --prefix=/usr -Ddrivers=goodixtls511 \
+    -Dudev_rules=disabled -Dudev_hwdb=disabled
 ninja -C build
 sudo ninja -C build install
 sudo ldconfig
 sudo systemctl restart fprintd
 ```
+
+`scripts/install.sh` does the clone + patches + build + install in one go.
+
+### Fedora 44
+
+```bash
+./scripts/install-fedora.sh            # --no-install, --skip-deps, --base-dir DIR
+```
+
+The script installs the dnf build dependencies, clones the base branch, applies
+both patches, builds and installs. Differences from the Debian path:
+
+* the driver option is **`goodixtls511`** — `goodixtls` is only a helper, and
+  meson aborts with `Key goodixtls is not in the dictionary` if you select it;
+* **SIGFM/OpenCV is compiled into the library** (`opencv-devel`, `gcc-c++`), and
+  patch 0002 drops its hard `doctest` dependency — Fedora ships doctest as a
+  CMake-only package without a `.pc` file;
+* only the shared library is replaced (`/usr/lib64/libfprint-2.so.2.0.0`), so no
+  `libfprint-devel` files are overwritten;
+* the backup lives in `/var/backups/libfprint-goodix5117/`. Keeping it next to
+  the library lets `ldconfig` register it as another provider of
+  `libfprint-2.so.2`, and fprintd then loads the **old** library — the symptom
+  is `No devices available` even though `lsusb` shows the sensor;
+* `restorecon` is run so the replacement keeps the `lib_t` SELinux label.
+
+Fedora notes:
+
+* `fprintd` is D-Bus activated; `systemctl is-enabled fprintd` reports `static`,
+  which is expected.
+* Fingerprint works for **sudo/su** (`pam_fprintd` is already in
+  `system-auth` when `authselect` has `with-fingerprint`) and for the **KDE lock
+  screen** (`/etc/pam.d/kde-fingerprint`, used by `kscreenlocker_greet`).
+  Plasma's login manager (`plasmalogin`) has no fingerprint UI, so the login
+  screen still asks for a password.
+* A long enrollment session can end with
+  `Device disabled to prevent overheating`; that is libfprint's thermal model,
+  wait a few minutes.
+* A `dnf update libfprint` replaces the patched library. Re-run
+  `install-fedora.sh` (it reuses the build) or copy
+  `~/src/libfprint-1/build/libfprint/libfprint-2.so.2.0.0` into place and run
+  `ldconfig`.
 
 Then:
 
@@ -292,11 +342,24 @@ LGPL-2.1-or-later, matching libfprint. See [LICENSE](LICENSE).
 ```bash
 git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
 cd libfprint-1
-git am /path/to/patches/0001-*.patch
-meson setup build -Ddrivers=goodixtls -Dudev_rules=disabled -Dudev_hwdb=disabled
+git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch
+meson setup build --prefix=/usr -Ddrivers=goodixtls511 \
+    -Dudev_rules=disabled -Dudev_hwdb=disabled
 ninja -C build && sudo ninja -C build install && sudo ldconfig
 sudo systemctl restart fprintd && fprintd-enroll
 ```
+
+Fedora 44 可直接用 `scripts/install-fedora.sh`。注意：
+
+- 驱动选项是 **`goodixtls511`**，`goodixtls` 只是 helper（选中会报
+  `Key goodixtls is not in the dictionary`）；
+- 本分支把 SIGFM 编进库，需要 `opencv-devel`/`gcc-c++`；补丁 0002 去掉了它的
+  doctest 硬依赖（Fedora 的 doctest 没有 `.pc` 文件）；
+- 原库备份放在 `/var/backups/libfprint-goodix5117/`。放在库目录里会被
+  `ldconfig` 当成另一个 `libfprint-2.so.2` 提供者，fprintd 反而加载旧库
+  （现象是 `No devices available`）；
+- Fedora 上 sudo/su 和 KDE 锁屏支持指纹（`system-auth` / `kde-fingerprint`），
+  登录界面 `plasmalogin` 没有指纹 UI，仍需密码。
 
 ### 已知限制
 

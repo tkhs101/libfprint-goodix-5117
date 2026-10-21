@@ -1,0 +1,34 @@
+From e8c7ae2cabaca26715e4b2faca044b01915e5b2d Mon Sep 17 00:00:00 2001
+From: tkhs101 <78359248+tkhs101@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 17:57:53 +0900
+Subject: [PATCH] sigfm: do not require doctest to build the library
+
+doctest is only used by the sigfm unit tests, and some distributions
+(e.g. Fedora) package it as a CMake-only dependency without a
+pkg-config file.  Meson then fails in setup even though nothing in the
+built library needs it.
+
+Drop the test executable so the library can be built without a test
+framework being discoverable through pkg-config.
+---
+ libfprint/sigfm/meson.build | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/libfprint/sigfm/meson.build b/libfprint/sigfm/meson.build
+index 454d412..03d33c3 100644
+--- a/libfprint/sigfm/meson.build
++++ b/libfprint/sigfm/meson.build
+@@ -2,10 +2,8 @@
+ sigfm_sources = ['sigfm.cpp']
+ 
+ opencv = dependency('opencv4', required: true)
+-doctest = dependency('doctest', required: true, version: ['>=2.0.0', '<3.0.0'])
+ 
+ libsigfm = static_library('sigfm',
+         sigfm_sources,
+         dependencies: [opencv],
+ )
+-sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
+-- 
+2.56.0
+
