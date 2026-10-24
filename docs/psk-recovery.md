@@ -26,7 +26,7 @@ preset_psk_write(0xbb010003, PSK_WHITE_BOX)   # APP 固件运行中
 ```
 结果:
 ```
-libfprint-DEBUG: GnuTLS handshake complete
+libfprint-DEBUG: TLS handshake complete (TLS1.2 / AES-128-GCM)
 libfprint-goodixtls5xx-DEBUG: Device PSK: 0xba1a8603...d72d43 (flags=0xbb020003, len=32)
 libfprint-goodixtls5xx-DEBUG: Enrollment complete with 20 descriptors
 ```
@@ -167,7 +167,10 @@ SHA256(PSK_WHITE_BOX) = ba1a86037c1d3c71c3af344955bd69a9a9861d9e911fa24985b677e8
 
 ## 八、执行脚本
 
-`docs/restore_5117.py`
+Windows 侧的 PSK 提取见 [`tools/goodix-psk-decrypt.ps1`](../tools/goodix-psk-decrypt.ps1)
+和 [`windows-psk-recovery.md`](windows-psk-recovery.md)。
+
+`tools/restore_5117.py`
 
 ```bash
 sudo /opt/goodix5117/venv/bin/python3 restore_5117.py --fw 12118

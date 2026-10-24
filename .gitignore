@@ -5,3 +5,7 @@ build/
 __pycache__/
 *.pyc
 firmware/
+
+# Per-device TLS-PSK, never commit it
+psk
+*.psk

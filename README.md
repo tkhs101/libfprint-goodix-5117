@@ -104,9 +104,10 @@ Two ways out, both documented in [docs/psk-write-findings.md](docs/psk-write-fin
 **A. Let the Windows driver provision it** (no flashing).
 Boot any Windows environment, install the Goodix UMDF driver (`gfspi.inf`
 matches `USB\VID_27C6&PID_5117`), let it touch the sensor once, then decrypt
-`C:\ProgramData\Goodix\Goodix_Cache.bin` with DPAPI entropy. Details in
-[docs/psk-recovery.md](docs/psk-recovery.md). The key goes to
-`/etc/goodix5117/psk`.
+`C:\ProgramData\Goodix\Goodix_Cache.bin` with DPAPI entropy. On Windows,
+[`tools/goodix-psk-decrypt.ps1`](tools/goodix-psk-decrypt.ps1) automates this;
+see [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md). The key goes
+to `/etc/goodix5117/psk`.
 
 **B. Reflash with the PSK written in IAP mode** (what we did).
 `tools/restore_5117.py` performs:
@@ -217,6 +218,8 @@ fprintd-enroll
 | Tool | Purpose |
 |---|---|
 | `tools/restore_5117.py` | Erase → write PSK in IAP → reflash → verify. Step-by-step, `--step N` to resume. |
+| `tools/goodix-psk-decrypt.ps1` | Windows: decrypt the per-device PSK from `Goodix_Cache.bin` (DPAPI, no flashing). |
+| `tools/extract-goodix-firmware.ps1` | Windows: extract and CRC/SHA-verify the firmware images embedded in `gfspi.dll`. |
 | `tools/goodix-dump-view` | Convert the per-frame PGM dumps into contrast-stretched PNGs. |
 | `goodix-dump-view` pairs with `GOODIX_DUMP_DIR`: |
 | `GOODIX_DUMP_DIR=/tmp/goodix-dump` | Dump every captured frame as PGM (env-gated). |
@@ -252,6 +255,7 @@ pipeline are documented but **not yet changed**:
 |---|---|
 | [docs/device-state.md](docs/device-state.md) | USB layout, firmware, current state |
 | [docs/psk-recovery.md](docs/psk-recovery.md) | The two PSK layers, firmware extraction, the reflash procedure |
+| [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md) | Windows-only PSK extraction (DPAPI, no flashing) and firmware extraction |
 | [docs/psk-write-findings.md](docs/psk-write-findings.md) | Exhaustive proof that APP-mode PSK writes are ignored on this family |
 | [docs/driver-changes.md](docs/driver-changes.md) | Per-change notes on the driver patch |
 | [docs/results.md](docs/results.md) | Before/after measurements |

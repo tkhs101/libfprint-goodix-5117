@@ -1,0 +1,105 @@
+name: build-goodix5117
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential meson ninja-build pkg-config \
+            libglib2.0-dev libgusb-dev libcairo2-dev libgnutls28-dev \
+            libgudev-1.0-dev libpixman-1-dev libopencv-dev
+
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/install-fedora.sh
+
+      - name: Clone base and apply patches
+        run: |
+          git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git base
+          cd base
+          git config user.name "goodix5117-ci"
+          git config user.email "goodix5117-ci@example.invalid"
+          git am ../patches/0001-*.patch ../patches/0002-*.patch
+
+      - name: Configure
+        run: |
+          cd base
+          meson setup build \
+            --prefix=/usr \
+            -Ddrivers=goodixtls511 \
+            -Dudev_rules=disabled \
+            -Dudev_hwdb=disabled \
+            -Ddoc=false \
+            -Dintrospection=false
+
+      - name: Build
+        run: ninja -C base/build
+
+  fedora:
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    steps:
+      - name: Install git for checkout
+        run: dnf install -y git tar gzip
+
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            meson ninja-build gcc gcc-c++ pkgconf-pkg-config \
+            glib2-devel libgusb-devel gnutls-devel systemd-devel \
+            cairo-devel pixman-devel libgudev-devel opencv-devel
+
+      - name: Clone base and apply patches
+        run: |
+          git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git /tmp/base
+          cd /tmp/base
+          git config user.name "goodix5117-ci"
+          git config user.email "goodix5117-ci@example.invalid"
+          git am "$GITHUB_WORKSPACE"/patches/0001-*.patch "$GITHUB_WORKSPACE"/patches/0002-*.patch
+
+      - name: Configure
+        run: |
+          cd /tmp/base
+          meson setup build \
+            --prefix=/usr \
+            -Ddrivers=goodixtls511 \
+            -Dudev_rules=disabled \
+            -Dudev_hwdb=disabled \
+            -Ddoc=false \
+            -Dintrospection=false
+
+      - name: Build
+        run: ninja -C /tmp/base/build
+
+  windows-tools:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse PowerShell tools
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem tools/*.ps1 | ForEach-Object {
+            try {
+              [void][scriptblock]::Create((Get-Content -Raw $_.FullName))
+              Write-Host "OK: $($_.Name)"
+            } catch {
+              Write-Host "FAIL: $($_.Name): $($_.Exception.Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
