@@ -323,9 +323,25 @@ Measured spans stay in the 1100–1750 range on successful scans, i.e. the
 calibration is *not* stale — a stale frame would show a near-zero span. So
 there is no evidence this needs changing.
 
-**Bottom line:** a normal, centred press works. The 2026-10 enroll completed
-20/20 stages with one `enroll-retry-scan`. What remains is genuine off-angle
-insensitivity, which is a property of the sensor, not of this pipeline.
+**Bottom line:** a normal press works. The 2026-10 enroll completed 20/20
+stages with one `enroll-retry-scan`.
+
+What actually limits recognition is **not** pressure or contrast but **overlap
+between presses**. Measured on real frames: a frame pair with normalised
+cross-correlation 0.68 scores 8252 (passes), while pairs at 0.38 and 0.30 score
+6 and 0 (fail). Contrast can drop to a third and still leave 106 keypoints;
+a few pixels of positional drift is what kills the match.
+
+Since libfprint's matcher already tries every stored template
+(`fpi-print.c` iterates `template->prints` and takes the best score), the
+practical advice is: **during enrolment, deliberately press slightly different
+positions** — centre, a bit left, a bit right, a bit high, a bit low. The wider
+the coverage, the more likely a random daily press hits one of them.
+
+Local histogram equalisation was measured and **rejected**: it raised the
+keypoint count but dropped the only passing cross-match from 8252 to 2616
+(−68%), because per-tile equalisation manufactures edges that the detector
+counts as features. See [docs/image-quality.md](docs/image-quality.md).
 
 `GOODIX_DUMP_DIR` still exists for comparing captures; note that fprintd runs a
 sandboxed service, so set `PrivateTmp=false` and a writable path in a drop-in
@@ -532,8 +548,29 @@ src=3573, by=2000  ->  1572      （应为 65535）
 1100–1750，**说明校准帧没有失效**（失效会表现为 span 接近 0）。没有证据支持
 需要改动。
 
-**结论：正常居中按压可正常使用。** 2026-10 那次录入 20/20 阶段全部通过，只有
-一次 `enroll-retry-scan`。剩下的是真实的按歪不敏感，那是传感器本身的特性。
+**结论：正常按压可正常使用。** 2026-10 那次录入 20/20 阶段全部通过，只有
+一次 `enroll-retry-scan`。
+
+**真正限制识别率的不是压力或对比度，而是两次按压的重叠程度。** 真实帧实测：
+
+| 帧对 | 归一化互相关 | 匹配分数 | 结果 |
+|---|---|---|---|
+| A↔B | 0.68 | 8252 | 通过 |
+| A↔C | 0.38 | 6 | 失败 |
+| B↔C | 0.30 | 0 | 失败 |
+
+对比度降到 1/3 仍有 106 个 keypoint（采集不失败），但**几个像素的位置偏移
+就足以让匹配归零**。
+
+因为 libfprint 的匹配逻辑本来就是遍历模板取最高分
+（`fpi-print.c` 里的 `template->prints`），所以实用建议是：
+
+> **录入时刻意按不同位置**——正面、略偏左、略偏右、略偏上、略偏下，每个位置
+> 按一次。覆盖范围越广，日常随机按下的位置越容易命中某个模板。
+
+**局部直方图均衡实测后被否决**：它确实能提高 keypoint 数，但让唯一能通过的
+交叉匹配从 8252 掉到 2616（−68%），因为分块均衡会在块边界制造伪边缘，
+被检测器当成特征。详见 [docs/image-quality.md](docs/image-quality.md)。
 
 > `GOODIX_DUMP_DIR` 仍然可用，但 fprintd 是沙箱化服务：要让转储文件落到有用
 > 的位置，需要在 drop-in 里设 `PrivateTmp=false` 并给出可写路径。
