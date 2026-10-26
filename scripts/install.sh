@@ -16,6 +16,7 @@ PATCH_DIR="$HERE/patches"
 PATCH="$PATCH_DIR/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch"
 PATCH2="$PATCH_DIR/0002-sigfm-do-not-require-doctest-to-build.patch"
 PATCH3="$PATCH_DIR/0003-goodixtls-fix-background-subtraction-wraparound.patch"
+PATCH4="$PATCH_DIR/0004-goodixtls-tests-for-the-image-pipeline.patch"
 SO=/usr/lib/x86_64-linux-gnu/libfprint-2.so.2.0.0
 # Keep the backup out of the library directories: ldconfig would otherwise
 # treat it as another provider of libfprint-2.so.2 and fprintd can end up
@@ -67,6 +68,13 @@ if git log --oneline | grep -q "background subtraction wraparound"; then
 else
   say "applying patch 0003"
   git am "$PATCH3" || die "patch 0003 did not apply cleanly (git am --abort to reset)"
+fi
+
+if git log --oneline | grep -q "cover the goodix 5xx image pipeline"; then
+  say "patch 0004 already applied"
+else
+  say "applying patch 0004"
+  git am "$PATCH4" || die "patch 0004 did not apply cleanly (git am --abort to reset)"
 fi
 
 say "configuring"

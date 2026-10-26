@@ -98,6 +98,14 @@ else
     || die "patch 0003 did not apply cleanly (git am --abort to reset)"
 fi
 
+if git log --oneline | grep -q "cover the goodix 5xx image pipeline"; then
+  say "patch 0004 already applied"
+else
+  say "applying patch 0004"
+  git am "$HERE/patches/0004-goodixtls-tests-for-the-image-pipeline.patch" \
+    || die "patch 0004 did not apply cleanly (git am --abort to reset)"
+fi
+
 say "configuring"
 if [ -d build ]; then
   meson setup build --wipe \

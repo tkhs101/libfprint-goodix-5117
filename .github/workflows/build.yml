@@ -79,6 +79,11 @@ jobs:
       - name: Build
         run: ninja -C base/build
 
+      - name: Run unit tests
+        run: |
+          cd base
+          meson test -C build --suite unit-tests --print-errorlogs
+
   fedora:
     runs-on: ubuntu-24.04
     strategy:

@@ -29,7 +29,8 @@ git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
 cd libfprint-1
 git am /path/to/patches/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch \
        /path/to/patches/0002-sigfm-do-not-require-doctest-to-build.patch \
-       /path/to/patches/0003-goodixtls-fix-background-subtraction-wraparound.patch
+       /path/to/patches/0003-goodixtls-fix-background-subtraction-wraparound.patch \
+       /path/to/patches/0004-goodixtls-tests-for-the-image-pipeline.patch
 # then run scripts/install.sh (Debian/Ubuntu) or scripts/install-fedora.sh,
 # or build manually (see below)
 ```
@@ -338,6 +339,7 @@ for the dump to land anywhere useful.
 |---|---|
 | [docs/firmware-extraction.md](docs/firmware-extraction.md) | **Verified** firmware extraction from the right driver package, plus the traps (wrong package, fake "12117"). |
 | [docs/flash-on-linux.md](docs/flash-on-linux.md) | Full recovery log: Linux-only, measured timings, post-flash verification. |
+| [docs/image-quality.md](docs/image-quality.md) | **Measured** keypoint data: why some presses fail, and what local equalisation would buy. |
 | [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md) | Windows-only PSK extraction (DPAPI, no flashing). |
 | [docs/psk-recovery.md](docs/psk-recovery.md) | The two PSK layers, the IAP reflash procedure, API audit. |
 | [docs/psk-write-findings.md](docs/psk-write-findings.md) | Exhaustive proof that APP-mode PSK writes are ignored on this family. |

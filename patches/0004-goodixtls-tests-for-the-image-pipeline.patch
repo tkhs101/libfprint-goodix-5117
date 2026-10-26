@@ -1,0 +1,348 @@
+From f55b2a6483bc288ec957bd2e36df3ee70e1c9df1 Mon Sep 17 00:00:00 2001
+From: tkhs101 <78359248+tkhs101@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:48:17 +0900
+Subject: [PATCH] tests: cover the goodix 5xx image pipeline
+
+Add unit tests for background subtraction and residual normalisation. Both are
+pure functions over a decoded frame, so they run without a device.
+
+The subtraction test is a regression test for the wraparound fixed earlier:
+the old unsigned expression returned ~1572 where 65535 was required, and a
+single such pixel was enough to flatten a whole frame. Running the suite
+against the old implementation fails with
+
+  assertion failed (src[i] == 0xffff): (1572 == 65535)
+
+The remaining cases pin down the behaviour the driver relies on: equal samples
+map to white, a darker scan keeps its difference, and a brighter one saturates
+rather than wrapping. The normalisation tests check full-scale mapping, that a
+lone outlier no longer collapses the range, and that a degenerate frame becomes
+black instead of dividing by zero.
+
+To make the subtraction testable the transform is promoted from a static
+helper to goodixtls5xx_subtract_background(): it is a meaningful step of the
+pipeline with its own contract, not an implementation detail.
+
+The tests link against libfprint-drivers because these symbols are not exported
+from the shared library; tests/meson.build gains a small link_with map for that.
+---
+ libfprint/drivers/goodixtls/goodix5xx.c |  11 +-
+ libfprint/drivers/goodixtls/goodix5xx.h |  21 +++
+ tests/meson.build                       |  19 ++-
+ tests/test-goodix5xx-image.c            | 195 ++++++++++++++++++++++++
+ 4 files changed, 240 insertions(+), 6 deletions(-)
+ create mode 100644 tests/test-goodix5xx-image.c
+
+diff --git a/libfprint/drivers/goodixtls/goodix5xx.c b/libfprint/drivers/goodixtls/goodix5xx.c
+index 72ee547..eaa0b2b 100644
+--- a/libfprint/drivers/goodixtls/goodix5xx.c
++++ b/libfprint/drivers/goodixtls/goodix5xx.c
+@@ -433,10 +433,10 @@ goodixtls5xx_frame_percentiles (const GoodixTls5xxPix *frame,
+  * Compute the difference in int32 and clamp, so a brighter scan pixel simply
+  * saturates at the top of the range instead of corrupting its neighbours.
+  */
+-static void
+-linear_subtract_inplace (GoodixTls5xxPix *src,
+-                         const GoodixTls5xxPix *by,
+-                         guint32 len)
++void
++goodixtls5xx_subtract_background (GoodixTls5xxPix *src,
++                                  const GoodixTls5xxPix *by,
++                                  guint32 len)
+ {
+   for (guint32 n = 0; n != len; ++n)
+     {
+@@ -466,7 +466,8 @@ scan_on_read_img (FpDevice *dev, guint8 *data, guint16 len,
+ 
+   GoodixTls5xxPix * raw_frame = calloc (cls->scan_width * cls->scan_height, sizeof (GoodixTls5xxPix));
+   goodixtls5xx_decode_frame (raw_frame, len, data);
+-  linear_subtract_inplace(raw_frame, priv->calibration_img, cls->scan_width * cls->scan_height);
++  goodixtls5xx_subtract_background (raw_frame, priv->calibration_img,
++                                    cls->scan_width * cls->scan_height);
+ 
+   /* Debug helper: the dynamic range of the background-subtracted frame shows
+    * whether the subtraction actually worked. A small span means the
+diff --git a/libfprint/drivers/goodixtls/goodix5xx.h b/libfprint/drivers/goodixtls/goodix5xx.h
+index 6b50433..4361887 100644
+--- a/libfprint/drivers/goodixtls/goodix5xx.h
++++ b/libfprint/drivers/goodixtls/goodix5xx.h
+@@ -269,6 +269,27 @@ void goodixtls5xx_squash_frame_linear (GoodixTls5xxPix *frame,
+                                        guint8          *squashed,
+                                        guint16          frame_size);
+ 
++/**
++ * @brief Subtract the calibration frame from a captured one, in place.
++ *
++ * @details Samples hold 12-bit values, so a scan frame may be either brighter
++ * or darker than the calibration frame. The result is biased by
++ * #GOODIX_SUBTRACT_OFFSET so that "identical to calibration" maps to white and
++ * "darker than calibration" keeps the difference. A sample brighter than the
++ * calibration frame saturates at white.
++ *
++ * Computing this in unsigned 16-bit arithmetic wraps when the scan sample is
++ * brighter, which is the bug this function replaced: a single wrapped pixel
++ * was enough to flatten the whole frame during normalisation.
++ *
++ * @param src scan frame, modified in place
++ * @param by calibration frame
++ * @param len number of samples in both frames
++ */
++void goodixtls5xx_subtract_background (GoodixTls5xxPix       *src,
++                                       const GoodixTls5xxPix *by,
++                                       guint32                len);
++
+ /**
+  * @brief Cleans up the state after activation. If you replaced the deactivate callback
+  * then you will need to call this, otherwise don't worry its done for you
+diff --git a/tests/meson.build b/tests/meson.build
+index 97a5bfa..33020c1 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -154,6 +154,16 @@ unit_tests = [
+     'fpi-assembling',
+ ]
+ 
++# The goodix 5xx image pipeline (background subtraction and normalisation) is
++# pure maths over a decoded frame, so it can be tested without a device. It
++# regressed once already: an unsigned subtraction wrapped whenever the scan
++# frame was brighter than the calibration frame, which flattened whole frames.
++if 'goodixtls511' in drivers
++    unit_tests += [
++        'goodix5xx-image',
++    ]
++endif
++
+ if 'virtual_image' in drivers
+     unit_tests += [
+         'fp-context',
+@@ -163,6 +173,12 @@ endif
+ 
+ unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+ 
++# Tests that exercise driver internals need the driver objects themselves: those
++# symbols are not exported from the shared library.
++unit_tests_link_with = {
++    'goodix5xx-image' : [libfprint_drivers],
++}
++
+ test_config = configuration_data()
+ test_config.set_quoted('SOURCE_ROOT', meson.source_root())
+ test_config_h = configure_file(output: 'test-config.h', configuration: test_config)
+@@ -193,11 +209,12 @@ foreach test_name: unit_tests
+     endif
+ 
+     basename = 'test-' + test_name
++    extra_link_with = unit_tests_link_with.get(test_name, [])
+     test_exe = executable(basename,
+         sources: [basename + '.c', test_config_h],
+         dependencies: [ libfprint_private_dep ] + extra_deps,
+         c_args: common_cflags,
+-        link_with: test_utils,
++        link_with: [test_utils] + extra_link_with,
+     )
+     test(test_name,
+         test_exe,
+diff --git a/tests/test-goodix5xx-image.c b/tests/test-goodix5xx-image.c
+new file mode 100644
+index 0000000..1ebacfa
+--- /dev/null
++++ b/tests/test-goodix5xx-image.c
+@@ -0,0 +1,195 @@
++/*
++ * Unit tests for the goodixtls 5xx image pipeline.
++ *
++ * These cover the background subtraction and the residual normalisation only:
++ * both are pure functions over the decoded frame, so they can be exercised
++ * without a device.
++ *
++ * Regression history: linear_subtract_inplace() used to compute
++ *
++ *   max - ((max - src) - (max - by))   ==   src - by + max   (mod 65536)
++ *
++ * which wrapped whenever the scan sample was brighter than the calibration
++ * sample, producing values near zero for pixels that should have been white.
++ * A single wrapped pixel widened the frame range to ~0..65535 and the
++ * normalisation then flattened every real pixel into a handful of grey levels.
++ */
++
++#include <glib.h>
++#include <string.h>
++
++#include "drivers/goodixtls/goodix5xx.h"
++
++static void
++test_subtract_equal_values_are_white (void)
++{
++  GoodixTls5xxPix src[] = { 2000, 0, 4095 };
++  const GoodixTls5xxPix by[] = { 2000, 0, 4095 };
++  const guint32 n = G_N_ELEMENTS (src);
++
++  goodixtls5xx_subtract_background (src, by, n);
++
++  for (guint32 i = 0; i < n; i++)
++    g_assert_cmpuint (src[i], ==, 0xffff);
++}
++
++static void
++test_subtract_darker_scan_keeps_difference (void)
++{
++  /* Scan darker than the calibration frame: the result is the difference,
++   * measured from white downwards. This is the case the old code handled. */
++  GoodixTls5xxPix src[] = { 2000 };
++  const GoodixTls5xxPix by[] = { 3573 };
++
++  goodixtls5xx_subtract_background (src, by, 1);
++
++  g_assert_cmpuint (src[0], ==, 0xffff - 1573);
++}
++
++static void
++test_subtract_brighter_scan_saturates (void)
++{
++  /* Regression: scan brighter than the calibration frame must saturate at
++   * white, not wrap around to a value near zero. */
++  GoodixTls5xxPix src[] = { 3573, 4095, 3000 };
++  const GoodixTls5xxPix by[] = { 2000, 0, 2999 };
++
++  goodixtls5xx_subtract_background (src, by, G_N_ELEMENTS (src));
++
++  for (guint32 i = 0; i < G_N_ELEMENTS (src); i++)
++    g_assert_cmpuint (src[i], ==, 0xffff);
++}
++
++static void
++test_subtract_no_wraparound_anywhere (void)
++{
++  /* Exhaustive-ish sweep: for every pair in the 12-bit range, the result must
++   * never be smaller than the value the old formula produced when it was
++   * correct, and must never wrap below the offset. */
++  for (guint32 s = 0; s <= 4095; s += 7)
++    {
++      for (guint32 b = 0; b <= 4095; b += 7)
++        {
++          GoodixTls5xxPix src[] = { (GoodixTls5xxPix) s };
++          const GoodixTls5xxPix by[] = { (GoodixTls5xxPix) b };
++
++          goodixtls5xx_subtract_background (src, by, 1);
++
++          if (s <= b)
++            g_assert_cmpuint (src[0], ==, 0xffff - (b - s));
++          else
++            g_assert_cmpuint (src[0], ==, 0xffff);
++        }
++    }
++}
++
++static void
++test_subtract_single_bad_pixel_does_not_flatten_frame (void)
++{
++  /* The frame used to observe the real collapse: ridge contrast of ~1700 on
++   * top of a uniform background. With the fix, the observer that normalises
++   * the frame must still see a usable range afterwards. */
++  enum { N = 7040 };
++  GoodixTls5xxPix raw[N];
++  GoodixTls5xxPix cal[N];
++
++  for (int i = 0; i < N; i++)
++    {
++      cal[i] = 2000;
++      raw[i] = (i % 2) ? 2000 : 300;   /* ridges vs valleys, scan darker */
++    }
++
++  /* One pixel brighter than the calibration frame. */
++  raw[N / 2] = 2001;
++
++  goodixtls5xx_subtract_background (raw, cal, N);
++
++  /* No wrapped pixel: everything is either the valley difference or white. */
++  const guint32 valley = 0xffff - (2000 - 300);
++  for (int i = 0; i < N; i++)
++    {
++      if (i == N / 2)
++        g_assert_cmpuint (raw[i], ==, 0xffff);
++      else
++        g_assert_cmpuint (raw[i], ==, ((i % 2) ? 0xffff : valley));
++    }
++}
++
++static void
++test_squash_maps_range_to_full_scale (void)
++{
++  enum { N = 100 };
++  GoodixTls5xxPix frame[N];
++  guint8 out[N];
++
++  /* Half the pixels at lo, half at hi: percentiles land on the extremes. */
++  for (int i = 0; i < N; i++)
++    frame[i] = (i < N / 2) ? 1000 : 3000;
++
++  goodixtls5xx_squash_frame_linear (frame, out, N);
++
++  g_assert_cmpuint (out[0], ==, 0);
++  g_assert_cmpuint (out[N - 1], ==, 255);
++}
++
++static void
++test_squash_ignores_single_outlier (void)
++{
++  enum { N = 100 };
++  GoodixTls5xxPix frame[N];
++  guint8 out[N];
++
++  for (int i = 0; i < N; i++)
++    frame[i] = (i < N / 2) ? 1000 : 3000;
++
++  /* A lone outlier well below the real range. */
++  frame[3] = 0;
++
++  goodixtls5xx_squash_frame_linear (frame, out, N);
++
++  /* The ridge pixels must still reach both ends of the scale. */
++  g_assert_cmpuint (out[0], ==, 0);
++  g_assert_cmpuint (out[N - 1], ==, 255);
++}
++
++static void
++test_squash_degenerate_frame_is_black (void)
++{
++  enum { N = 64 };
++  GoodixTls5xxPix frame[N];
++  guint8 out[N];
++
++  for (int i = 0; i < N; i++)
++    frame[i] = 1234;
++
++  memset (out, 0xaa, sizeof (out));
++  goodixtls5xx_squash_frame_linear (frame, out, N);
++
++  for (int i = 0; i < N; i++)
++    g_assert_cmpuint (out[i], ==, 0);
++}
++
++int
++main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/goodix5xx/subtract/equal-is-white",
++                   test_subtract_equal_values_are_white);
++  g_test_add_func ("/goodix5xx/subtract/darker-keeps-difference",
++                   test_subtract_darker_scan_keeps_difference);
++  g_test_add_func ("/goodix5xx/subtract/brighter-saturates",
++                   test_subtract_brighter_scan_saturates);
++  g_test_add_func ("/goodix5xx/subtract/no-wraparound",
++                   test_subtract_no_wraparound_anywhere);
++  g_test_add_func ("/goodix5xx/subtract/bad-pixel-keeps-frame",
++                   test_subtract_single_bad_pixel_does_not_flatten_frame);
++  g_test_add_func ("/goodix5xx/squash/full-scale",
++                   test_squash_maps_range_to_full_scale);
++  g_test_add_func ("/goodix5xx/squash/ignores-outlier",
++                   test_squash_ignores_single_outlier);
++  g_test_add_func ("/goodix5xx/squash/degenerate-is-black",
++                   test_squash_degenerate_frame_is_black);
++
++  return g_test_run ();
++}
+-- 
+2.55.0
+
