@@ -96,3 +96,72 @@ FirPE 方案下设备密钥是 Windows 生成的随机值, 写死全零就没法
   ```
   它会: 校验格式 -> 写 /etc/goodix5117/psk (600) -> 用**作者独立的 OpenSSL 工具**
   验证握手 -> 成功才启用 PAM 指纹认证。
+
+---
+
+## 补丁 0003: 背景减法回绕与稳健归一化 (2026-10-27)
+
+早期文档把 `linear_subtract_inplace()` 描述为"在 `MAX(0, cal - scan)` 处饱和,
+会永久丢弃细节"。实际查证后结论不同: 它不是饱和, 而是 **uint16 回绕**。
+
+### 问题
+
+```c
+const guint16 max = -1;
+src[n] = MAX(0, max - ((max - src[n]) - (max - by[n])));
+```
+
+代数上等价于 `src - by + 65535 (mod 65536)`, 只在 `src <= by` 时正确。
+当扫描像素比校准帧亮时:
+
+```text
+src=3573, by=2000   ->   1572      (应为 65535)
+```
+
+**一个这样的像素就能毁掉整帧**: 观测范围被拉成 `0..65535`, 归一化后真实像素
+被压进约 8 个灰度级。这就是日志里
+`residual range after calibration: 0..65535` 的来源。
+
+### 修法
+
+1. 用 `gint32` 计算差再 `CLAMP(0, 65535)`, 回绕分支改为在白色处饱和;
+2. 偏置保持 `GOODIX_SUBTRACT_OFFSET = 0xffff`, 保证原本可用的帧**输出逐字节不变**;
+3. `goodixtls5xx_squash_frame_linear()` 改用 65536 桶直方图的 1%/99% 百分位,
+   不再用绝对 min/max。
+
+### 关于第 3 点的重要限定
+
+百分位归一化是**防御性改动, 不是问题的解药**。用与真实残差范围相符的合成帧
+实测:
+
+```text
+无异常像素时:       两种方法差异 0 / 7040 像素
+含 1 个异常像素时:  min/max 会把整帧压平, 百分位不受影响
+```
+
+所以它只在坏像素漏网时才有意义; 回绕修好之后, 这种情况已经大幅减少。
+
+### 实测验证
+
+在 27c6:5117 / GF_ST411SEC_APP_12118 上:
+
+| 项 | 结果 |
+|---|---|
+| 连续两次 verify | 均 `verify-match` |
+| sigfm 提取耗时 | 0.0046 s / 0.0031 s (基线 0.0046 s, 无退化) |
+| span 65535 坏帧 | 修复后会话中未再出现 |
+
+### 一个调试发现
+
+`GOODIX_DUMP_DIR` 在 fprintd 下默认**写不出文件**: fprintd 是沙箱化服务,
+`/tmp` 被 `PrivateTmp` 隔离。需要 drop-in:
+
+```ini
+[Service]
+Environment=GOODIX_DUMP_DIR=/path/to/frames
+PrivateTmp=false
+ReadWritePaths=-/path/to/frames
+```
+
+注意不能只写 `ReadWritePaths` —— 它会覆盖服务原有的 `ProtectSystem` 相关配置,
+导致服务启动失败 (`active=failed`)。

@@ -90,6 +90,14 @@ else
     || die "patch 0002 did not apply cleanly (git am --abort to reset)"
 fi
 
+if git log --oneline | grep -q "background subtraction wraparound"; then
+  say "patch 0003 already applied"
+else
+  say "applying patch 0003"
+  git am "$HERE/patches/0003-goodixtls-fix-background-subtraction-wraparound.patch" \
+    || die "patch 0003 did not apply cleanly (git am --abort to reset)"
+fi
+
 say "configuring"
 if [ -d build ]; then
   meson setup build --wipe \

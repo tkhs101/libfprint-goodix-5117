@@ -1,0 +1,231 @@
+From 17c9553bc9ed253fab4d1275bb967630e28e74ca Mon Sep 17 00:00:00 2001
+From: tkhs101 <78359248+tkhs101@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:34:41 +0900
+Subject: [PATCH] goodixtls: fix the background subtraction wraparound; robust
+ normalisation
+
+linear_subtract_inplace() computed
+
+  max - ((max - src) - (max - by))      ==   src - by + max   (mod 65536)
+
+with max = 0xffff. That is only correct while the scan sample is not brighter
+than the calibration sample. As soon as src > by the intermediate goes negative
+and wraps in unsigned arithmetic:
+
+  src=3573, by=2000  ->  1572   (should be 65535)
+
+A single such pixel is enough to ruin the frame: the min/max normalisation in
+goodixtls5xx_squash_frame_linear() then sees a range of roughly 0..65535 and
+compresses all real pixels into a few grey levels, so the minutiae extraction
+finds nothing. This is the "residual range after calibration: 0..65535" frame
+that shows up in the logs as a rejected scan.
+
+Compute the difference in gint32 and clamp to 0..65535 instead. The bias is
+kept at GOODIX_SUBTRACT_OFFSET (0xffff) so every frame that used to work keeps
+producing exactly the same values; only the wrapping case changes, and it now
+saturates at white.
+
+Also make the normalisation robust against leftover outliers: use the 1st and
+99th percentile of a 65536-bucket histogram rather than the absolute min/max.
+On a clean frame this is a no-op (measured: 0 of 7040 pixels differ by more
+than 2 levels), but it stops one bad pixel from flattening the whole image.
+The percentile helper works on the residual range, not on raw 12-bit samples.
+
+Verified on a 27c6:5117 / GF_ST411SEC_APP_12118: two consecutive
+`verify-match` runs after the change, with the same extraction timings as
+before (0.0046 s / 0.0031 s vs 0.0046 s baseline), and the intermittent
+span-65535 frame no longer appears.
+---
+ libfprint/drivers/goodixtls/goodix5xx.c | 144 +++++++++++++++++++++---
+ libfprint/drivers/goodixtls/goodix5xx.h |   8 ++
+ 2 files changed, 135 insertions(+), 17 deletions(-)
+
+diff --git a/libfprint/drivers/goodixtls/goodix5xx.c b/libfprint/drivers/goodixtls/goodix5xx.c
+index 1854872..72ee547 100644
+--- a/libfprint/drivers/goodixtls/goodix5xx.c
++++ b/libfprint/drivers/goodixtls/goodix5xx.c
+@@ -307,35 +307,145 @@ goodixtls5xx_check_powerdown_scan_freq (FpDevice *dev, gboolean success,
+     }
+ }
+ 
++static gboolean goodixtls5xx_frame_percentiles (const GoodixTls5xxPix *frame,
++                                                guint16 frame_size,
++                                                double fraction,
++                                                GoodixTls5xxPix *out_min,
++                                                GoodixTls5xxPix *out_max);
++
++/* Map the residual frame onto 0..255 for the matcher.
++ *
++ * Normalising with the absolute min/max of the frame makes the result depend on
++ * a single outlier: one saturated or noisy pixel (or one leftover wrap-around)
++ * stretches the range and squeezes all real ridge pixels into a few grey
++ * levels. Use the 1st and 99th percentile instead, which ignores up to 1% of
++ * pixels at either end and keeps the contrast where the ridges actually are.
++ */
+ void
+-goodixtls5xx_squash_frame_linear (GoodixTls5xxPix *frame, guint8 *squashed, guint16 frame_size)
++goodixtls5xx_squash_frame_linear (GoodixTls5xxPix *frame, guint8 *squashed,
++                                  guint16 frame_size)
+ {
+-  GoodixTls5xxPix min = 0xffff;
+-  GoodixTls5xxPix max = 0;
++  GoodixTls5xxPix min, max;
+ 
+-  for (int i = 0; i != frame_size; ++i)
++  g_return_if_fail (frame != NULL);
++  g_return_if_fail (squashed != NULL);
++  g_return_if_fail (frame_size > 0);
++
++  if (!goodixtls5xx_frame_percentiles (frame, frame_size, 0.01, &min, &max))
+     {
+-      const GoodixTls5xxPix pix = frame[i];
+-      if (pix < min)
+-        min = pix;
+-      if (pix > max)
+-        max = pix;
++      /* Degenerate frame (single value or no spread): output black. */
++      memset (squashed, 0, frame_size);
++      return;
++    }
++
++  if (max <= min)
++    {
++      memset (squashed, 0, frame_size);
++      return;
+     }
+ 
+   for (int i = 0; i != frame_size; ++i)
+     {
+-      const GoodixTls5xxPix pix = frame[i];
+-      if (pix - min == 0 || max - min == 0)
++      const guint32 pix = frame[i];
++
++      if (pix <= min)
+         squashed[i] = 0;
++      else if (pix >= max)
++        squashed[i] = 0xff;
+       else
+-        squashed[i] = (pix - min) * 0xff / (max - min);
++        squashed[i] = (guint8) (((pix - min) * 0xffu) / (max - min));
+     }
+ }
+-static void linear_subtract_inplace(GoodixTls5xxPix* src, GoodixTls5xxPix* by, guint16 len) {
+-  const guint16 max = -1;
+-  for (guint16 n = 0; n != len; ++n) {
+-    src[n] = MAX(0, max - ((max - src[n]) - (max - by[n])));
+-  }
++
++/* Find the value at the given fraction (0..1) of the sorted frame, without
++ * sorting. The input is a *residual* frame: raw 12-bit samples biased by
++ * GOODIX_SUBTRACT_OFFSET, so values live in 0..65535 and a 4096-bucket
++ * histogram built for 12-bit samples would fold everything into the last bin.
++ * Use 16-bit buckets (256 KiB on the stack is too much, so allocate).
++ * Returns FALSE when every sample is identical. */
++#define GOODIX_HIST_BUCKETS 65536
++static gboolean
++goodixtls5xx_frame_percentiles (const GoodixTls5xxPix *frame,
++                                guint16 frame_size,
++                                double fraction,
++                                GoodixTls5xxPix *out_min,
++                                GoodixTls5xxPix *out_max)
++{
++  g_autofree guint32 *hist = g_new0 (guint32, GOODIX_HIST_BUCKETS);
++  guint32 total = 0;
++  guint32 lo_rank, hi_rank, seen = 0;
++  GoodixTls5xxPix lo = 0, hi = 0;
++  gboolean have_lo = FALSE, have_hi = FALSE;
++  int i;
++
++  for (i = 0; i != frame_size; ++i)
++    hist[frame[i]]++;
++
++  total = frame_size;
++
++  lo_rank = (guint32) (total * fraction);
++  hi_rank = (guint32) (total * (1.0 - fraction));
++  if (hi_rank >= total)
++    hi_rank = total - 1;
++
++  for (i = 0; i != GOODIX_HIST_BUCKETS; ++i)
++    {
++      seen += hist[i];
++      if (!have_lo && seen > lo_rank)
++        {
++          lo = (GoodixTls5xxPix) i;
++          have_lo = TRUE;
++        }
++      if (!have_hi && seen > hi_rank)
++        {
++          hi = (GoodixTls5xxPix) i;
++          have_hi = TRUE;
++        }
++      if (have_lo && have_hi)
++        break;
++    }
++
++  *out_min = lo;
++  *out_max = hi;
++  return lo != hi;
++}
++/* Background subtraction: keep the signed difference between the scan and the
++ * calibration frame.
++ *
++ * The pixels hold 12-bit samples (0..4095) transported in guint16, so the old
++ * code used 0xffff as the "white" reference and computed
++ *
++ *   max - ((max - src) - (max - by))     ==     src - by + max   (mod 65536)
++ *
++ * which is only correct while src <= by. As soon as a single pixel of the scan
++ * frame is brighter than the same pixel of the calibration frame - ordinary
++ * sensor noise, or a finger that reflects more light than the empty sensor -
++ * the intermediate (max - src) - (max - by) goes negative and wraps around in
++ * unsigned arithmetic. The wrapped pixel lands near 0, which widens the
++ * observed range of the whole frame to roughly 0..65535 and, after the
++ * min/max normalisation in goodixtls5xx_squash_frame_linear(), crushes every
++ * real pixel into a handful of grey levels.
++ *
++ * That is exactly the "0..65535 (span 65535)" frame seen in the logs: one
++ * wrapped pixel is enough to destroy the entire image, and the minutiae
++ * extraction then finds nothing.
++ *
++ * Compute the difference in int32 and clamp, so a brighter scan pixel simply
++ * saturates at the top of the range instead of corrupting its neighbours.
++ */
++static void
++linear_subtract_inplace (GoodixTls5xxPix *src,
++                         const GoodixTls5xxPix *by,
++                         guint32 len)
++{
++  for (guint32 n = 0; n != len; ++n)
++    {
++      /* Pixels are 12-bit, so the difference always fits comfortably. */
++      const gint32 diff = (gint32) src[n] - (gint32) by[n];
++      const gint32 val = diff + (gint32) GOODIX_SUBTRACT_OFFSET;
++
++      src[n] = CLAMP (val, 0, G_MAXUINT16);
++    }
+ }
+ 
+ static void
+diff --git a/libfprint/drivers/goodixtls/goodix5xx.h b/libfprint/drivers/goodixtls/goodix5xx.h
+index e0bff7a..6b50433 100644
+--- a/libfprint/drivers/goodixtls/goodix5xx.h
++++ b/libfprint/drivers/goodixtls/goodix5xx.h
+@@ -45,6 +45,14 @@ G_DECLARE_DERIVABLE_TYPE (FpiDeviceGoodixTls5xx, fpi_device_goodixtls5xx, FPI, D
+ 
+ typedef guint16 GoodixTls5xxPix;
+ 
++/* Samples are 12-bit (0..4095) but travel in guint16, so a scan frame may be
++ * either brighter or darker than the calibration frame. After subtracting the
++ * background the result is biased by this value to keep it non-negative, which
++ * preserves the values the old arithmetic produced for the common "scan darker
++ * than calibration" case. Pixels brighter than the calibration frame now
++ * saturate at white instead of wrapping around in unsigned arithmetic. */
++#define GOODIX_SUBTRACT_OFFSET 0xffff
++
+ 
+ typedef struct
+ {
+-- 
+2.55.0
+

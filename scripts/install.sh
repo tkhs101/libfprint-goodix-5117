@@ -12,8 +12,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_DIR="${HOME}/src"
-PATCH="$HERE/patches/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch"
-PATCH2="$HERE/patches/0002-sigfm-do-not-require-doctest-to-build.patch"
+PATCH_DIR="$HERE/patches"
+PATCH="$PATCH_DIR/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch"
+PATCH2="$PATCH_DIR/0002-sigfm-do-not-require-doctest-to-build.patch"
+PATCH3="$PATCH_DIR/0003-goodixtls-fix-background-subtraction-wraparound.patch"
 SO=/usr/lib/x86_64-linux-gnu/libfprint-2.so.2.0.0
 # Keep the backup out of the library directories: ldconfig would otherwise
 # treat it as another provider of libfprint-2.so.2 and fprintd can end up
@@ -58,6 +60,13 @@ if git log --oneline | grep -q "do not require doctest"; then
 else
   say "applying $PATCH2"
   git am "$PATCH2" || die "patch 0002 did not apply cleanly (git am --abort to reset)"
+fi
+
+if git log --oneline | grep -q "background subtraction wraparound"; then
+  say "patch 0003 already applied"
+else
+  say "applying patch 0003"
+  git am "$PATCH3" || die "patch 0003 did not apply cleanly (git am --abort to reset)"
 fi
 
 say "configuring"

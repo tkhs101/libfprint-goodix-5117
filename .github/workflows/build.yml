@@ -63,7 +63,7 @@ jobs:
           cd base
           git config user.name "goodix5117-ci"
           git config user.email "goodix5117-ci@example.invalid"
-          git am ../patches/0001-*.patch ../patches/0002-*.patch
+          git am ../patches/000*.patch
 
       - name: Configure
         run: |
@@ -107,7 +107,7 @@ jobs:
           cd /tmp/base
           git config user.name "goodix5117-ci"
           git config user.email "goodix5117-ci@example.invalid"
-          git am "$GITHUB_WORKSPACE"/patches/0001-*.patch "$GITHUB_WORKSPACE"/patches/0002-*.patch
+          git am "$GITHUB_WORKSPACE"/patches/000*.patch
 
       - name: Configure
         run: |

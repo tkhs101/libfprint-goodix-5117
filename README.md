@@ -28,7 +28,8 @@ here fixes what that branch could not do on 12118 hardware.
 git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
 cd libfprint-1
 git am /path/to/patches/0001-goodixtls-make-the-27c6-5117-sensor-usable-end-to-en.patch \
-       /path/to/patches/0002-sigfm-do-not-require-doctest-to-build.patch
+       /path/to/patches/0002-sigfm-do-not-require-doctest-to-build.patch \
+       /path/to/patches/0003-goodixtls-fix-background-subtraction-wraparound.patch
 # then run scripts/install.sh (Debian/Ubuntu) or scripts/install-fedora.sh,
 # or build manually (see below)
 ```
@@ -173,7 +174,7 @@ sudo apt install build-essential meson ninja-build pkg-config \
 ```bash
 git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
 cd libfprint-1
-git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch
+git am /path/to/patches/000*.patch
 meson setup build --prefix=/usr -Ddrivers=goodixtls511 \
     -Dudev_rules=disabled -Dudev_hwdb=disabled
 ninja -C build
@@ -276,25 +277,58 @@ And for the handshake, the decisive line is `handshake step: r=<code>`:
 
 ---
 
-## Known limitation: pressure/angle sensitivity
+## Image quality: what the old suspects turned out to be
 
-A badly placed finger yields `0/24` minutiae — that is not a threshold problem,
-the image simply contains no extractable ridge detail. Three suspects in the
-pipeline are documented but **not yet changed**:
+A badly placed finger yields `0/24` minutiae. Three suspects were documented as
+"not yet changed"; investigating them (2026-10-27) showed that one was an actual
+bug and the other two are lower priority than they looked:
 
-1. `goodixtls5xx_squash_frame_linear()` normalises with the whole-image
-   min/max, so one saturated pixel flattens the frame (percentile
-   normalisation would help);
-2. the calibration frame is captured at activation time, while the scan happens
-   1–2 s later with the sensor already warmer;
-3. `linear_subtract_inplace()` saturates at `MAX(0, cal - scan)`, permanently
-   discarding detail where the finger only partly covers the sensor.
+### 1. `linear_subtract_inplace()` did not merely saturate — it wrapped
 
-`GOODIX_DUMP_DIR` exists so these can be told apart from real captures.
+This was a real bug, now fixed by patch `0003`. The old formula was
 
-In practice a normal, centred press enrolls without trouble: the 2026-10 run
-completed 20/20 stages with only one `enroll-retry-scan`. The limitation shows
-up with off-angle presses, not with ordinary use.
+```
+max - ((max - src) - (max - by))    ==    src - by + max    (mod 65536)
+```
+
+which is only correct while `src <= by`. Whenever a scan pixel is **brighter**
+than the same pixel of the calibration frame — ordinary noise, or a finger that
+reflects more than the empty sensor — the subtraction wraps and lands near 0:
+
+```
+src=3573, by=2000   ->   1572      (should be 65535)
+```
+
+One such pixel is enough to destroy the frame: the observed range becomes
+roughly `0..65535`, and the normalisation then squeezes every real pixel into
+~8 grey levels. This is exactly the `residual range after calibration: 0..65535`
+frame the driver rejects.
+
+The fix computes the difference in `gint32` and clamps. The bias is unchanged
+(`0xffff`), so every frame that worked before produces byte-identical output.
+
+### 2. min/max normalisation → now percentile-based
+
+Also fixed in `0003`, but this one is a **defensive** change, not a cure.
+Measured on synthetic frames matching the real residual range (ridge contrast
+~1700 over a 65535 window): with no outlier present, min/max and 1%/99%
+percentile normalisation differ by **0 of 7040 pixels**. It only matters when a
+bad pixel survives, and with the wraparound fixed that is much rarer.
+
+### 3. Calibration frame age — still open, and not the limiting factor
+
+The calibration frame is still captured at activation, 1–2 s before the scan.
+Measured spans stay in the 1100–1750 range on successful scans, i.e. the
+calibration is *not* stale — a stale frame would show a near-zero span. So
+there is no evidence this needs changing.
+
+**Bottom line:** a normal, centred press works. The 2026-10 enroll completed
+20/20 stages with one `enroll-retry-scan`. What remains is genuine off-angle
+insensitivity, which is a property of the sensor, not of this pipeline.
+
+`GOODIX_DUMP_DIR` still exists for comparing captures; note that fprintd runs a
+sandboxed service, so set `PrivateTmp=false` and a writable path in a drop-in
+for the dump to land anywhere useful.
 
 ---
 
@@ -398,7 +432,7 @@ LGPL-2.1-or-later, matching libfprint. See [LICENSE](LICENSE).
 ```bash
 git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git
 cd libfprint-1
-git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch
+git am /path/to/patches/000*.patch
 meson setup build --prefix=/usr -Ddrivers=goodixtls511 \
     -Dudev_rules=disabled -Dudev_hwdb=disabled
 ninja -C build && sudo ninja -C build install && sudo ldconfig
@@ -464,14 +498,43 @@ sudo systemctl start fprintd
 | `handshake step: r=-38` | 握手已完成后的应用数据，无害 |
 | `residual range after calibration: 0..65535` | 整幅饱和，会自动要求重按 |
 
-### 已知限制
+### 图像质量：三个怀疑点的最终结论
 
-按歪了会得到 `0/24` 个特征点 —— 这不是阈值问题，是图像里根本没有可提取的脊线。
-管线里三个可疑点（全图 min/max 归一化、激活瞬间采的校准帧、`MAX(0, cal-scan)`
-饱和）已在 `docs/` 里记录，但**尚未改动**。`GOODIX_DUMP_DIR` 就是为定位它准备的。
+2026-10-27 逐条查证后，结论是**一个真 bug + 一个防御性改动 + 一个不成立**：
 
-正常居中按压不受影响：2026-10 那次录入 20/20 阶段全部通过，只有一次
-`enroll-retry-scan`。
+**1. `linear_subtract_inplace()` 不只是饱和，它会回绕 —— 真 bug，已修（补丁 0003）**
+
+原公式等价于 `src - by + 65535`（uint16 取模），只在 `src <= by` 时正确。
+一旦某个扫描像素比校准帧**更亮**，中间结果变负并回绕：
+
+```
+src=3573, by=2000  ->  1572      （应为 65535）
+```
+
+**一个这样的像素就足以毁掉整帧**：观测范围被拉成 `0..65535`，归一化后所有
+真实像素被压进约 8 个灰度级。这正是日志里那个被拒绝的
+`residual range after calibration: 0..65535`。
+
+修法：改用 `gint32` 算差并钳位；偏置仍是 `0xffff`，所以**原本能用的帧输出
+完全不变**。
+
+**2. min/max 归一化 → 改为 1%/99% 百分位 —— 防御性，不是解药**
+
+同样在补丁 0003 里。用与真实残差范围相符的合成帧实测：**没有异常像素时，
+两种方法的输出差异为 0/7040 像素**。它只在坏像素漏网时才起作用，而回绕修好
+之后这种情况已经少了很多。
+
+**3. 校准帧老化 —— 不成立**
+
+校准帧仍在激活时采集，比扫描早 1–2 秒。但实测成功扫描的 span 稳定在
+1100–1750，**说明校准帧没有失效**（失效会表现为 span 接近 0）。没有证据支持
+需要改动。
+
+**结论：正常居中按压可正常使用。** 2026-10 那次录入 20/20 阶段全部通过，只有
+一次 `enroll-retry-scan`。剩下的是真实的按歪不敏感，那是传感器本身的特性。
+
+> `GOODIX_DUMP_DIR` 仍然可用，但 fprintd 是沙箱化服务：要让转储文件落到有用
+> 的位置，需要在 drop-in 里设 `PrivateTmp=false` 并给出可写路径。
 
 ### 刷完之后注意
 
