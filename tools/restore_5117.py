@@ -34,10 +34,17 @@ sys.path.insert(0, FP_DUMP)
 FWDIR = os.environ.get("GOODIX_FW_DIR",
                        os.path.expanduser("~/.local/share/goodix5117/firmware"))
 # 可选固件: (文件名, 长度, CRC-32/MPEG-2)
+#
+# 12118 是这块设备的原厂固件, 也是**唯一推荐的选项**。它可以从
+# Microsoft Update Catalog 的 "Goodix FP - Biometric - 1.1.124.115"
+# (UpdateID 5075f1e9-7377-49b2-b7f5-eef87d69d067) 中的 gfspi.dll 提取,
+# 详见 docs/firmware-extraction.md。该驱动包内含 32 份镜像:
+#   16 x 12118/5110 (CRC 0x886AE278) + 16 x 12118/5117 (CRC 0xD90EC273)
+# 其中**没有** 12117 或 12109, 所以 12117 需要另行获取。
 FW_OPTIONS = {
     # 设备当前运行的原版固件 (同版本刷新, 完全可逆)
     "12118": (f"{FWDIR}/GF_ST411SEC_APP_12118_5117.bin", 102336, 0xD90EC273),
-    # issue #83 实证成功过的版本 (降级, 但社区验证过完整流程)
+    # issue #83 实证成功过的版本 (降级; 镜像不包含在上述驱动包中)
     "12117": (f"{FWDIR}/GF_ST411SEC_APP_12117_5117.bin", 102264, 0xDBD51539),
 }
 PSK_WHITE_BOX = bytes.fromhex(
@@ -140,11 +147,19 @@ def main():
         log(f"   (唤醒序列有告警, 继续: {e})")
 
     fw_path, FW_LEN, FW_CRC = FW_OPTIONS[args.fw]
-    fw = open(fw_path, 'rb').read()
+    try:
+        fw = open(fw_path, 'rb').read()
+    except FileNotFoundError:
+        log(f"!! 找不到固件镜像: {fw_path}")
+        log("   固件是厂商二进制, 不随本仓库分发。请按 docs/firmware-extraction.md")
+        log("   从 Goodix 1.1.124.115 驱动的 gfspi.dll 中提取, 或用 GOODIX_FW_DIR")
+        log("   指向已含有该文件的目录。")
+        log("   ★ 没有镜像就不要擦除: 擦掉之后无法从设备取回原固件。")
+        return 9
     if len(fw) != FW_LEN:
         log(f"!! 固件长度异常: {len(fw)} != {FW_LEN}"); return 9
     if crc32_mpeg(fw) != FW_CRC:
-        log("!! 固件 CRC 校验失败, 拒绝继续."); return 9
+        log(f"!! 固件 CRC 校验失败 (期望 0x{FW_CRC:08X}), 拒绝继续."); return 9
     log(f"固件就绪: {fw_path}")
     log(f"   len={len(fw)}  crc=0x{FW_CRC:08X}  (版本 {args.fw})")
 

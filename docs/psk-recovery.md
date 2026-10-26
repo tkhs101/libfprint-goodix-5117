@@ -41,13 +41,40 @@ libfprint-goodixtls5xx-DEBUG: Enrollment complete with 20 descriptors
 ### 来源
 Microsoft Update Catalog -> "Goodix FP - Biometric 1.1.124.115"
 (与 issue #83 提到的 OEM 包 "Fingerprint 1.1.124.12" 同系列)
-下载链接 (2026-10-20 取得):
+
+**UpdateID**（用它可以稳定定位到这个包）:
+```text
+5075f1e9-7377-49b2-b7f5-eef87d69d067
 ```
-GUID b2c2cfc4-f216-48d9-86d4-989f439652f2
-https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2025/09/
-  d93f567f-6244-4974-9348-d83f5262073d_bf3bf694447c87fdc6e4fdf087a608f36fed5571.cab
+
+下载直链（2026-10-26 复核有效）:
+```text
+https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2024/08/
+  0e3b5d0d-2680-490f-be54-c74728d34b24_4b367f0bd9b93bc414e067ebb4b0dcb2e4e9b1c1.cab
 ```
-解包后 `gfspi.dll` (5.5 MB) 的 .rdata 段内含 32 份固件副本。
+
+> ⚠️ **早期版本本文给出的是 `.../2025/09/d93f567f-...cab`，那是 `1.1.18.27`，
+> 其 `gfspi.dll` 只有 920 KB、不含任何固件，不要再用。**
+> 正确的包解出来 `gfspi.dll` 是 **5.52 MB**，`gfspi.inf` 里
+> `DriverVer = 07/12/2024,1.1.124.115`。
+>
+> 链接有时效性。稳妥做法是按 UpdateID 现查，完整步骤见
+> [`firmware-extraction.md`](firmware-extraction.md)。
+
+解包后 `gfspi.dll` (5.52 MB) 的 .rdata 段内含 32 份固件副本。
+
+### 这个包里实际有什么 (2026-10-26 复核)
+
+| 长度 | 版本 | PID | CRC-32/MPEG-2 | 份数 |
+|---|---|---|---|---|
+| 102336 | `GF_ST411SEC_APP_12118` | 5110 | `0x886AE278` | 16 |
+| 102336 | `GF_ST411SEC_APP_12118` | **5117** | **`0xD90EC273`** | **16** |
+
+**只有 12118，没有 12117，也没有 12109。**
+
+另外注意：按 `102264` 字节去切同一份 12118 镜像，会得到一个 CRC 为
+`0xE4DDD1B7` 的"假 12117"（只是 12118 的前缀，版本串仍写着 12118），
+那不是真正的 12117（真 12117 的 CRC 是 `0xDBD51539`）。
 
 ### 固件记录格式 (已完全破解)
 ```
@@ -64,7 +91,8 @@ https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/202
 | GF_ST411SEC_APP_12118_5110.bin | 102336 | 0x886AE278 | 3c580fdc2ca0847833a4f940675236f51f7fbc81fc32dfa45ac8142067fb477e |
 | GF_ST411SEC_APP_12117.bin (本地已有, 5110版) | 102264 | 0x8AB13532 | b82d1458624f9b4f13c307858177cb3b30476d2250d9e0fc3440caa35c39c24d |
 
-归档位置: `/opt/goodix5117/windows-driver/firmware/`
+归档位置: 建议放在 `$GOODIX_FW_DIR`（默认 `~/.local/share/goodix5117/firmware/`）。
+**不要放在 `/tmp`**，重启会丢。提取脚本见 [`firmware-extraction.md`](firmware-extraction.md)。
 
 ### 提取正确性的三重验证
 1. **32 份副本**: 16 份 5110 版 + 16 份 5117 版, 每组 16 份**字节完全一致** (唯一 SHA256 = 1)
@@ -148,12 +176,13 @@ SHA256        = 57c60649...  ★ 与 issue #83 完全一致
 
 ## 六、最终固件库
 
-`/opt/goodix5117/windows-driver/firmware/`
-| 文件 | 长度 | CRC-32/MPEG-2 | 用途 |
-|---|---|---|---|
-| GF_ST411SEC_APP_12118_5117.bin | 102336 | 0xD90EC273 | **设备原版固件 (同版本刷新, 可逆)** |
-| GF_ST411SEC_APP_12117_5117.bin | 102264 | 0xDBD51539 | issue #83 实证成功版 (降级, 双保险) |
-| GF_ST411SEC_APP_12118_5110.bin | 102336 | 0x886AE278 | 对照用 (PID 0x5110) |
+放在 `$GOODIX_FW_DIR`（默认 `~/.local/share/goodix5117/firmware/`）
+
+| 文件 | 长度 | CRC-32/MPEG-2 | 用途 | 来源 |
+|---|---|---|---|---|
+| GF_ST411SEC_APP_12118_5117.bin | 102336 | 0xD90EC273 | **设备原版固件 (同版本刷新, 可逆)** | 1.1.124.115 驱动包内 |
+| GF_ST411SEC_APP_12118_5110.bin | 102336 | 0x886AE278 | 对照用 (PID 0x5110) | 同上 |
+| GF_ST411SEC_APP_12117_5117.bin | 102264 | 0xDBD51539 | issue #83 实证成功版 (降级，双保险) | **不在该驱动包内**，需另行获取 |
 
 ## 七、闭环验证: PMK = SHA256(白盒)
 
@@ -173,9 +202,14 @@ Windows 侧的 PSK 提取见 [`tools/goodix-psk-decrypt.ps1`](../tools/goodix-ps
 `tools/restore_5117.py`
 
 ```bash
-sudo /opt/goodix5117/venv/bin/python3 restore_5117.py --fw 12118
-# 分步: --step 2 (写PSK) / --step 4 (刷固件) / --step 6 (重启)
+export GOODIX_FP_DUMP=~/goodix-fp-dump
+export GOODIX_FW_DIR=~/.local/share/goodix5117/firmware
+sudo python3 tools/restore_5117.py --fw 12118
+# 分步: --step 1 (擦除) / --step 2 (写PSK+刷固件+校验+重启)
 ```
+
+需要 `pyusb` 与 `spidev`（`protocol.py` 会导入它们）。实测完整流程见
+[`flash-on-linux.md`](flash-on-linux.md)。
 与 `driver_51x7.py` 的关键差异: **失败时不二次擦除**, 保留 IAP 状态可用同一镜像重试。
 
 ## 九、离线预检结果 (全部通过)

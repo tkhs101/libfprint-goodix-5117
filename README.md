@@ -7,10 +7,18 @@ therefore no longer accepts the factory TLS key.
 Tested on an **Honor MagicBook Pro 2020 (HLYL-WXX9)**, firmware
 `GF_ST411SEC_APP_12118`, libfprint 1.94.5 / fprintd 1.94.5.
 
+Also verified on **Fedora 45** with libfprint 1.94.100 / fprintd 1.94.5
+(GCC 16, OpenCV 4.13, GnuTLS 3.8) — see
+[docs/flash-on-linux.md](docs/flash-on-linux.md) for the full recovery log.
+
 This repository is an **incremental patch** on top of
 [`gulp/libfprint-1`](https://github.com/gulp/libfprint-1), branch
 `goodix-5117-support`, which already carries the basic 5117 support. Everything
 here fixes what that branch could not do on 12118 hardware.
+
+> **No Windows install required.** The whole recovery — firmware extraction,
+> PSK reset, reflash, enroll, verify — was completed on a Linux-only machine.
+> Windows is one of two routes, not a requirement.
 
 ---
 
@@ -109,6 +117,11 @@ matches `USB\VID_27C6&PID_5117`), let it touch the sensor once, then decrypt
 see [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md). The key goes
 to `/etc/goodix5117/psk`.
 
+> This route only works while that Windows install still exists. DPAPI binds the
+> cache to the user/machine that wrote it: once the Windows environment is gone,
+> the key is unrecoverable. If you might need it later, decrypt and save the key
+> **before** wiping Windows.
+
 **B. Reflash with the PSK written in IAP mode** (what we did).
 `tools/restore_5117.py` performs:
 
@@ -121,14 +134,25 @@ check_firmware   ->  CRC-32/MPEG-2 must match
 reset            ->  back to APP mode
 ```
 
+This is the only route that works **without** Windows, and the whole procedure
+runs on Linux. A full end-to-end run (erase → reflash → enroll → verify) took
+about **three seconds** of actual flashing; see
+[docs/flash-on-linux.md](docs/flash-on-linux.md) for the measured log.
+
 > **The firmware image is required and is not shipped here** — it is a vendor
 > binary. Point `GOODIX_FW_DIR` at a directory containing
-> `GF_ST411SEC_APP_12118_5117.bin` (102336 B, CRC-32/MPEG-2 `0xD90EC273`).
-> [docs/psk-recovery.md](docs/psk-recovery.md) explains how it was extracted
-> from the Windows driver package. **Without the image, do not erase**: the
-> bootloader survives, but an empty APP partition on a sensor whose `0xf2`
-> (read firmware) is unimplemented means there is no way to get the old image
-> back off the device.
+> `GF_ST411SEC_APP_12118_5117.bin` (102336 B, CRC-32/MPEG-2 `0xD90EC273`,
+> SHA256 `d7fb2f4c…88fd1`).
+>
+> **[docs/firmware-extraction.md](docs/firmware-extraction.md) has the verified
+> extraction procedure.** Note that most driver packages on Microsoft Update
+> Catalog do **not** contain this firmware: you need *Goodix FP - Biometric -
+> 1.1.124.115* (UpdateID `5075f1e9-…`), not the commonly-cited 1.1.18.27, whose
+> `gfspi.dll` has no images at all.
+>
+> **Without the image, do not erase**: the bootloader survives, but an empty APP
+> partition on a sensor whose `0xf2` (read firmware) is unimplemented means there
+> is no way to get the old image back off the device.
 
 The script never erases twice: every failure path leaves the sensor in IAP mode,
 which is recoverable by re-running step 4.
@@ -215,19 +239,40 @@ fprintd-enroll
 
 ## Tools
 
-| Tool | Purpose |
-|---|---|
-| `tools/restore_5117.py` | Erase → write PSK in IAP → reflash → verify. Step-by-step, `--step N` to resume. |
-| `tools/goodix-psk-decrypt.ps1` | Windows: decrypt the per-device PSK from `Goodix_Cache.bin` (DPAPI, no flashing). |
-| `tools/extract-goodix-firmware.ps1` | Windows: extract and CRC/SHA-verify the firmware images embedded in `gfspi.dll`. |
-| `tools/goodix-dump-view` | Convert the per-frame PGM dumps into contrast-stretched PNGs. |
-| `goodix-dump-view` pairs with `GOODIX_DUMP_DIR`: |
-| `GOODIX_DUMP_DIR=/tmp/goodix-dump` | Dump every captured frame as PGM (env-gated). |
+| Tool | Platform | Purpose |
+|---|---|---|
+| `tools/probe_psk.py` | Linux | **Read-only** diagnostic: prints the firmware version and the PSK digest, and tells you whether the sensor is factory-state or re-provisioned. Run this *before* deciding to flash. |
+| `tools/restore_5117.py` | Linux | Erase → write PSK in IAP → reflash → verify. Step-by-step, `--step N` to resume. |
+| `tools/goodix-psk-decrypt.ps1` | Windows | Decrypt the per-device PSK from `Goodix_Cache.bin` (DPAPI, no flashing). |
+| `tools/extract-goodix-firmware.ps1` | Windows | Extract and CRC/SHA-verify the firmware images embedded in `gfspi.dll`. |
+| `tools/goodix-dump-view` | Linux | Convert the per-frame PGM dumps into contrast-stretched PNGs. |
 
-The patch also logs `residual range after calibration: X..Y (span Z)` — a small
-span means the calibration frame no longer describes the sensor (temperature
-drift between activation and scan), which flattens the ridges and makes minutiae
-extraction fail entirely.
+`goodix-dump-view` pairs with `GOODIX_DUMP_DIR` (dump every captured frame as
+PGM, env-gated):
+
+```bash
+GOODIX_DUMP_DIR=/tmp/goodix-dump fprintd-verify
+tools/goodix-dump-view
+```
+
+### Reading the logs
+
+The patch logs `residual range after calibration: X..Y (span Z)`. Use the span
+to judge frame quality:
+
+| Span | Meaning |
+|---|---|
+| ~1000–2000 | Good ridge detail, frame is usable |
+| `0..65535` (span 65535) | Fully saturated — finger pressed too hard or badly placed; libfprint will ask you to re-scan |
+| near 0 | Calibration frame no longer describes the sensor (temperature drift); ridges flattened |
+
+And for the handshake, the decisive line is `handshake step: r=<code>`:
+
+| Code | Meaning |
+|---|---|
+| `r=0` | Handshake succeeded — the PSK is correct |
+| `r=-24` | `GNUTLS_E_DECRYPTION_FAILED`: **wrong PSK**. Do not chase TLS settings |
+| `r=-38` | `GNUTLS_E_GOT_APPLICATION_DATA`: harmless, arrives after a *successful* handshake |
 
 ---
 
@@ -247,20 +292,27 @@ pipeline are documented but **not yet changed**:
 
 `GOODIX_DUMP_DIR` exists so these can be told apart from real captures.
 
+In practice a normal, centred press enrolls without trouble: the 2026-10 run
+completed 20/20 stages with only one `enroll-retry-scan`. The limitation shows
+up with off-angle presses, not with ordinary use.
+
 ---
 
 ## Documentation
 
 | File | Contents |
 |---|---|
-| [docs/device-state.md](docs/device-state.md) | USB layout, firmware, current state |
-| [docs/psk-recovery.md](docs/psk-recovery.md) | The two PSK layers, firmware extraction, the reflash procedure |
-| [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md) | Windows-only PSK extraction (DPAPI, no flashing) and firmware extraction |
-| [docs/psk-write-findings.md](docs/psk-write-findings.md) | Exhaustive proof that APP-mode PSK writes are ignored on this family |
-| [docs/driver-changes.md](docs/driver-changes.md) | Per-change notes on the driver patch |
-| [docs/results.md](docs/results.md) | Before/after measurements |
-| [docs/no-flash-options.md](docs/no-flash-options.md) | The non-flashing route in detail |
-| [docs/flash-preview.md](docs/flash-preview.md) | Pre-flight checks for the reflash |
+| [docs/firmware-extraction.md](docs/firmware-extraction.md) | **Verified** firmware extraction from the right driver package, plus the traps (wrong package, fake "12117"). |
+| [docs/flash-on-linux.md](docs/flash-on-linux.md) | Full recovery log: Linux-only, measured timings, post-flash verification. |
+| [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md) | Windows-only PSK extraction (DPAPI, no flashing). |
+| [docs/psk-recovery.md](docs/psk-recovery.md) | The two PSK layers, the IAP reflash procedure, API audit. |
+| [docs/psk-write-findings.md](docs/psk-write-findings.md) | Exhaustive proof that APP-mode PSK writes are ignored on this family. |
+| [docs/driver-changes.md](docs/driver-changes.md) | Per-change notes on the driver patch. |
+| [docs/results.md](docs/results.md) | Before/after measurements (first recovery, 2026-10-20). |
+| [docs/device-state.md](docs/device-state.md) | USB layout, firmware, key state, confirmed device behaviour. |
+| [docs/conclusion.md](docs/conclusion.md) | One-page summary of the causal chain and the two routes. |
+| [docs/no-flash-options.md](docs/no-flash-options.md) | The non-flashing route in detail. |
+| [docs/flash-preview.md](docs/flash-preview.md) | Historical pre-flight checks for the reflash. |
 
 ---
 
@@ -353,7 +405,7 @@ ninja -C build && sudo ninja -C build install && sudo ldconfig
 sudo systemctl restart fprintd && fprintd-enroll
 ```
 
-Fedora 44 可直接用 `scripts/install-fedora.sh`。注意：
+Fedora 可直接用 `scripts/install-fedora.sh`（Fedora 44 与 45 均实测通过）。注意：
 
 - 驱动选项是 **`goodixtls511`**，`goodixtls` 只是 helper（选中会报
   `Key goodixtls is not in the dictionary`）；
@@ -365,10 +417,67 @@ Fedora 44 可直接用 `scripts/install-fedora.sh`。注意：
 - Fedora 上 sudo/su 和 KDE 锁屏支持指纹（`system-auth` / `kde-fingerprint`），
   登录界面 `plasmalogin` 没有指纹 UI，仍需密码。
 
+Fedora 45 实测环境：libfprint 1.94.100、fprintd 1.94.5、GCC 16.2、OpenCV 4.13、
+GnuTLS 3.8.13，构建无报错（仅有来自 OpenCV 头文件的格式属性警告，无害）。
+
+### 固件从哪里来（重要）
+
+绝大多数 Catalog 驱动包**不含** 5117 固件。必须用
+**Goodix FP - Biometric - 1.1.124.115**（UpdateID `5075f1e9-…`），
+它的 `gfspi.dll` 有 5.52 MB，内含 32 份镜像（16×5110 + 16×5117）。
+
+常见错误是下载 `1.1.18.27`（`gfspi.dll` 只有 920 KB），里面一个固件字符串都没有。
+另一个坑：按 `102264` 字节切同一份 12118 镜像会得到一个 CRC 为 `0xE4DDD1B7`
+的"假 12117"，那不是真 12117（真 12117 的 CRC 是 `0xDBD51539`，且版本串为
+`12117`）。
+
+完整流程（含直链获取、提取脚本、三重验证）见
+[docs/firmware-extraction.md](docs/firmware-extraction.md)。
+
+### 先把状态探清楚，再决定要不要刷
+
+```bash
+sudo systemctl stop fprintd
+sudo GOODIX_FP_DUMP=~/goodix-fp-dump python3 tools/probe_psk.py
+sudo systemctl start fprintd
+```
+
+它会打印固件版本和 PSK 摘要，并直接告诉你结论：
+
+- 摘要 = `ba1a8603...` → **出厂状态**，全零密钥即可用，**不需要刷机**
+- 摘要 ≠ 出厂值 → 已被重新 provision，需要导密钥或刷机
+
+这一步能避免绝大多数无谓的刷机。
+
+### 刷机实录
+
+一次完整的 Linux 单系统恢复（擦除 → 写 PSK → 刷固件 → 录入 → 验证）
+实测只用了约 **3 秒**的刷写时间，全程不需要 Windows。日志与判读方法见
+[docs/flash-on-linux.md](docs/flash-on-linux.md)。
+
+关键日志判读：
+
+| 日志 | 含义 |
+|---|---|
+| `handshake step: r=0` | 握手成功，密钥正确 |
+| `handshake step: r=-24` | **密钥错误**，不要再查 TLS 配置 |
+| `handshake step: r=-38` | 握手已完成后的应用数据，无害 |
+| `residual range after calibration: 0..65535` | 整幅饱和，会自动要求重按 |
+
 ### 已知限制
 
 按歪了会得到 `0/24` 个特征点 —— 这不是阈值问题，是图像里根本没有可提取的脊线。
 管线里三个可疑点（全图 min/max 归一化、激活瞬间采的校准帧、`MAX(0, cal-scan)`
 饱和）已在 `docs/` 里记录，但**尚未改动**。`GOODIX_DUMP_DIR` 就是为定位它准备的。
+
+正常居中按压不受影响：2026-10 那次录入 20/20 阶段全部通过，只有一次
+`enroll-retry-scan`。
+
+### 刷完之后注意
+
+- **不要再让任何 Windows 环境接触这个传感器**。Windows 驱动会重新 provision，
+  PSK 变回随机值，当前全零配置立刻失效，必须再刷一次。
+- `dnf update libfprint` 会覆盖补丁库，需要重新部署。
+- 固件镜像和驱动包建议长期保留，它们是唯一的恢复保险。
 
 </details>

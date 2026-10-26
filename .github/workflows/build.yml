@@ -24,6 +24,39 @@ jobs:
           bash -n scripts/install.sh
           bash -n scripts/install-fedora.sh
 
+      - name: Check python syntax
+        run: |
+          python3 -m py_compile tools/restore_5117.py
+          python3 -m py_compile tools/probe_psk.py
+
+      - name: Check tracked files have no CRLF
+        run: |
+          bad=$(git ls-files -z | xargs -0 -r file | grep -i 'CRLF' | grep -v '\.ps1' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::files with CRLF line endings (see .gitattributes):"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Check docs links resolve
+        run: |
+          fail=0
+          for f in README.md docs/*.md; do
+            dir=$(dirname "$f")
+            grep -oE '\]\([^)#][^)]*\)' "$f" \
+              | sed 's/^](//; s/)$//' \
+              | grep -vE '^(https?|mailto):' \
+              | while read -r link; do
+                  target="${link%%#*}"
+                  [ -z "$target" ] && continue
+                  if [ ! -e "$dir/$target" ] && [ ! -e "$target" ]; then
+                    echo "::error file=$f::broken relative link: $link"
+                    echo "$f|$link" >> /tmp/broken-links
+                  fi
+                done
+          done
+          [ -f /tmp/broken-links ] && exit 1 || exit 0
+
       - name: Clone base and apply patches
         run: |
           git clone -b goodix-5117-support https://github.com/gulp/libfprint-1.git base
@@ -48,7 +81,13 @@ jobs:
 
   fedora:
     runs-on: ubuntu-24.04
-    container: fedora:44
+    strategy:
+      fail-fast: false
+      matrix:
+        # 44 is the version the earliest release was verified on; 45 is the
+        # current one (libfprint 1.94.100, GCC 16, OpenCV 4.13).
+        container: [fedora:44, fedora:45]
+    container: ${{ matrix.container }}
     steps:
       - name: Install git for checkout
         run: dnf install -y git tar gzip

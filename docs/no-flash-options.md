@@ -94,8 +94,14 @@ SHA256(PSK_WHITE_BOX) = ba1a86037c1d3c71c3af344955bd69a9a9861d9e911fa24985b677e8
 附加 `wudfhost.exe`, 拦截 `mbedtls_ssl_conf_psk`, dump 32 字节明文 PSK。
 比方案 A 复杂, 但不依赖 DPAPI, 且能直接确认拿到的是明文。
 
-### 方案 D: 刷机回出厂 PSK [用户暂不考虑]
-见 `FLASH-PREVIEW.md`。固件文件本地已有。
+### 方案 D: 刷机回出厂 PSK [最终采用的就是这条]
+
+见 [`flash-on-linux.md`](flash-on-linux.md)（实测实录）与
+[`firmware-extraction.md`](firmware-extraction.md)（固件提取）。
+
+**后续结论**：方案 A/B/C 都依赖"那个 Windows 环境仍然存在"。一旦 Windows 被
+清除，DPAPI 缓存无法解密，A/B/C 全部失效，方案 D 成为唯一可行路径。它不需要
+Windows，全程可在 Linux 完成，且 2026-10 已实测成功。
 
 ---
 
@@ -169,13 +175,18 @@ driver version: 1.1.124.12
 
 ## 六、附: 关键文件位置
 
-| 内容 | 路径 |
-|---|---|
-| 设备固件 12109 / 12117 | `/opt/goodix5117/fp-dump/firmware/51x7|51x0/` |
-| 刷机工具 | `/opt/goodix5117/fp-dump/driver_51x7.py` |
-| 原生工具 (已编译) | `/opt/goodix5117/driver/build/` |
-| Windows 驱动包 | `/opt/goodix5117/windows-driver/` |
-| 逆向文档 (法文, 极详尽) | `/opt/goodix5117/driver/SPEC.md` |
-| Windows 反汇编 | `/tmp/buxel2/analysis/win-system/disassembly/` |
-| 本机 libfprint 补丁 | `/tmp/goodix511-final.diff` |
-| 原版备份 | `/root/libfprint-backup/` |
+> 下表是 2026-10-20 那台机器上的临时布局，**换机器后这些路径都不存在**。
+> 仓库内的正式位置见第二列。
+
+| 内容 | 当时的临时路径 | 现在应该用 |
+|---|---|---|
+| 设备固件 | `/opt/goodix5117/fp-dump/firmware/` | `$GOODIX_FW_DIR/`，见 [`firmware-extraction.md`](firmware-extraction.md) |
+| 刷机工具 | `/opt/goodix5117/fp-dump/driver_51x7.py` | [`tools/restore_5117.py`](../tools/restore_5117.py) |
+| 原生工具（已编译） | `/opt/goodix5117/driver/build/` | 无对应，已被补丁驱动取代 |
+| Windows 驱动包 | `/opt/goodix5117/windows-driver/` | 从 Catalog 重新下载，见 [`firmware-extraction.md`](firmware-extraction.md) |
+| 逆向文档 SPEC.md | `/opt/goodix5117/driver/SPEC.md` | `goodix-fp-dump` 仓库内 |
+| 本机 libfprint 补丁 | `/tmp/goodix511-final.diff` | [`patches/`](../patches/) |
+| 原版库备份 | `/root/libfprint-backup/` | `/var/backups/libfprint-goodix5117/` |
+
+**`/tmp` 下的东西重启即失效**，不要依赖它们。真正需要长期保留的只有两样：
+固件镜像、原版 `libfprint-2.so.2.0.0`。

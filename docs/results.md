@@ -85,18 +85,25 @@ fprintd-enroll          # 录入指纹, 按提示把手指放上去
 
 ## 备份与回退
 
+> 下表的机器专属路径来自 2026-10-20 那次操作的主机。换机器时路径会不同，
+> 关键是**保住固件镜像和原版 libfprint**这两样。
+
 | 内容 | 位置 |
 |---|---|
-| 原版固件 (可任意重刷) | `/opt/goodix5117/windows-driver/firmware/GF_ST411SEC_APP_12118_5117.bin` |
-| 降级保险 12117 | `/opt/goodix5117/windows-driver/firmware/GF_ST411SEC_APP_12117_5117.bin` |
-| 恢复脚本 | `docs/restore_5117.py` |
-| 驱动源码补丁 | `libfprint-1` (分支 goodix-5117-support) |
-| 原版 libfprint | `/root/libfprint-backup/` |
-| 完整技术文档 | `docs/` |
-| FirPE 备选方案 | `/opt/goodix5117/firpe-kit/` (已不需要) |
+| 原版固件 (可任意重刷) | `$GOODIX_FW_DIR/GF_ST411SEC_APP_12118_5117.bin`，102336 B / CRC `0xD90EC273` |
+| 降级保险 12117 | `GF_ST411SEC_APP_12117_5117.bin`，102264 B / CRC `0xDBD51539`（**不在 1.1.124.115 驱动包内**，需另行获取） |
+| 恢复脚本 | [`tools/restore_5117.py`](../tools/restore_5117.py) |
+| 只读状态探测 | [`tools/probe_psk.py`](../tools/probe_psk.py) |
+| 固件提取流程 | [`docs/firmware-extraction.md`](firmware-extraction.md) |
+| 驱动源码补丁 | [`patches/`](../patches/)，基线 `gulp/libfprint-1` 分支 `goodix-5117-support` |
+| 原版 libfprint | `/var/backups/libfprint-goodix5117/libfprint-2.so.2.0.0` |
 
-### 驱动补丁的三处改动 (缺一不可)
-1. `goodix511.h` — `goodix_511_psk_0[]` = **出厂值** `ba1a8603...`
-   (改成 91d8b7... 或其它值都会导致 PSK 比对失败)
+### 驱动补丁的关键改动（缺一不可）
+
+1. `goodix511.h` — `goodix_511_psk_0[]` = **出厂值** `ba1a8603...`，
+   同时 `GOODIX_511_INTERFACE` 必须是 **1**（数据端点在 interface 1 上）
 2. `goodix5xx.c` — PSK `memcmp` 失败降级为 `fp_warn` 而非致命
 3. `goodixtls.c` — TLS 密钥支持从 `/etc/goodix5117/psk` 读取
+4. `goodix511.c` — **先建 TLS 再跑激活序列**；FDT 命令使用各自的寄存器表
+5. `goodix.h` — 图像采集超时 `GOODIX_IMAGE_TIMEOUT` = 10 秒
+6. `goodix5xx.c` — 采集后立即上报 finger-off，否则成功匹配会被记成 `verify-no-match`

@@ -1,0 +1,14 @@
+# Normalise line endings: the repository is developed on Linux but the docs are
+# also edited on Windows, and a CRLF checkout breaks every shell script with
+# "$'\r': command not found".
+* text=auto eol=lf
+
+# PowerShell scripts must keep CRLF so that Windows PowerShell 5.1 parses them.
+*.ps1 text eol=crlf
+
+# Binary-ish files: never touch them.
+*.png binary
+*.jpg binary
+*.bin binary
+*.pgm binary
+*.cab binary

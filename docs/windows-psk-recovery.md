@@ -211,7 +211,7 @@ CRC-32/MPEG-2 和 SHA256 分组。实测 `1.1.124.115`：
 
 | 项 | 值 |
 |---|---|
-| USB | `USB\VID_27C6&PID_5117\00000000001A` |
+| USB | `USB\VID_27C6&PID_5117\<serial，已脱敏>` |
 | Windows 驱动 | Goodix FP `1.1.124.115`（`oem18.inf`，`WUDFRd`） |
 | 缓存 | 332 B = 324 B DPAPI + 8 B seed |
 | 常量位置 | `gfspi.dll` `0x537e40` |
