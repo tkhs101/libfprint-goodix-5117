@@ -1,6 +1,6 @@
 # 不刷机方案分析 (最终版)
 
-日期: 2026-10-20
+日期: 2026-10-20（第五节于 2026-10 复核更新）
 机型: Honor MagicBook Pro (HLYL-WXX9), 固件 GF_ST411SEC_APP_12118
 设备: Goodix 27c6:5117, 序列号 <serial>
 
@@ -72,7 +72,7 @@ SHA256(PSK_WHITE_BOX) = ba1a86037c1d3c71c3af344955bd69a9a9861d9e911fa24985b677e8
 
 步骤:
 1. U 盘启动 FirPE (本机已有 ISO)
-2. 准备 5117 的 USB 内核驱动 (见"待补"一节)
+2. 准备 5117 的 Windows 驱动包（见第五节）
 3. 在 FirPE 里加载驱动, 接触芯片 -> 生成新 PSK + Cache.bin
 4. 跑 `goodix_psk_decrypt.ps1` 解密得到明文 PSK
 5. 写回本机 `/etc/goodix5117/psk`
@@ -150,26 +150,36 @@ sudo cp /opt/goodix5117/driver/clef.txt /etc/goodix5117/psk
 
 ---
 
-## 五、仍待解决: 5117 的 USB 内核驱动
+## 五、5117 的 Windows 驱动：早期判断与最终结论
 
-Microsoft Update Catalog 里**没有** 5117 的 USB 驱动:
-- "Goodix FP - Biometric 1.1.18.27" 只匹配 `ACPI\GXFP5130` (Nuvoton EC), 是 UMDF 用户态栈
-- 搜索 `VID_27C6` 得到的 25 个包**全是 MOC 触控板驱动**
-- 华为 PC Manager 11.1.6.31 也不含指纹驱动 (其 `TriFinger` 是屏下指纹 UI)
+写这份文档时（2026-10-20）只找到匹配 `ACPI\GXFP5130`（Nuvoton EC）的
+"Goodix FP - Biometric 1.1.18.27"，于是判断 5117 没有可用的 Windows 驱动。
+**这个判断已经推翻：**
 
-WBDI.log 证明该驱动的身份:
-```
-Goodix>>> WBDI Build Dec 10 2020
-Hardware ID: USB\VID_27C6&PID_5110&REV_0200
-driver version: 1.1.124.12
-```
+- **1.1.124.115**（UpdateID `5075f1e9-7377-49b2-b7f5-eef87d69d067`）的
+  `gfspi.inf` 明确匹配 `USB\VID_27C6&PID_5117`，走 `WUDFRd`（UMDF 用户态），
+  **不需要第三方内核驱动**；
+- 2026-10 在 Windows build 26300 上实测：驱动正常加载，并在
+  `C:\ProgramData\Goodix\Goodix_Cache.bin` 写入 332 字节 DPAPI 缓存；
+- 所以方案 A/B 缺的不是"USB 内核驱动"，而是"正确的驱动包"。
 
-**获取途径 (待尝试)**:
-1. Honor/MagicBook 官方 Windows 驱动包 (华为官网/PC Manager 内的驱动仓库)
-2. 联想 ThinkPad 驱动页 (Goodix 驱动通用, 5125/5110 多数通用)
-3. [goodix-fp-linux-dev/goodix-fp-dump](https://github.com/goodix-fp-linux-dev/goodix-fp-dump) 仓库或 issue 区
-4. 闲鱼/淘宝二手的"指纹驱动包"
-5. 方案 C (x64dbg) —— 需要同一个驱动, 但只需用户态 DLL, 门槛更低
+获取、解包与验证见 [`firmware-extraction.md`](firmware-extraction.md)
+（同一个包也是 12118 固件的来源）；密钥提取见
+[`windows-psk-recovery.md`](windows-psk-recovery.md)。
+
+<details>
+<summary>当时的排查记录（已过时，仅作背景）</summary>
+
+- "Goodix FP - Biometric 1.1.18.27" 只匹配 `ACPI\GXFP5130`（Nuvoton EC），
+  是 UMDF 用户态栈；
+- 搜索 `VID_27C6` 得到的 25 个包全是 MOC 触控板驱动；
+- 华为 PC Manager 11.1.6.31 也不含指纹驱动（其 `TriFinger` 是屏下指纹 UI）；
+- WBDI.log 显示当时的驱动身份是
+  `USB\VID_27C6&PID_5110&REV_0200`，版本 `1.1.124.12`；
+- 曾计划从 Honor/联想驱动页、`goodix-fp-dump` issue 区或二手驱动包获取，
+  最终都不需要：1.1.124.115 可直接从 Microsoft Update Catalog 下载。
+
+</details>
 
 ---
 

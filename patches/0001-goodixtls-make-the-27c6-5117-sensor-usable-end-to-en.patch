@@ -599,21 +599,21 @@ index 215ef53..87496a4 100644
 -static GError *
 -err_from_ssl (void)
 +/* TLS 1.2 with PSK key exchange only. The sensor offers exactly one real
-+ * suite, PSK-AES256-GCM-SHA384 (0x00a8), plus the SCSV placeholder. */
-+/* Matches the known-good reference driver ordering: DHE-PSK preferred, plain
-+ * PSK as fallback. */
-+/* The sensor offers exactly one real suite: 0x00a8
-+ * (TLS_PSK_WITH_AES_128_GCM_SHA256). "NORMAL:+AES-128-GCM" still prefers
-+ * AES-256 first, so restrict the cipher list explicitly. */
++ * suite, TLS_PSK_WITH_AES_128_GCM_SHA256 (0x00a8), plus the SCSV
++ * placeholder. The priority string spells out each restriction:
++ * -VERS-ALL/+VERS-TLS1.2 pins the protocol, -KX-ALL/+PSK leaves only PSK
++ * key exchange, and -CIPHER-ALL/+AES-128-GCM leaves only the suite above. */
++/* "NORMAL:+AES-128-GCM" alone still offers AES-256 variants first, so the
++ * cipher list has to be restricted explicitly rather than extended. */
 +#define GOODIX_TLS_PRIORITY \
 +  "NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+PSK:-CIPHER-ALL:+AES-128-GCM"
 +
-+/* The sensor's TLS transport is keyed with an all-zero PSK. The 32 bytes read
-+ * back with Preset PSK Read (0xe4) are an identity/provisioning token, not the
-+ * TLS key, so they must not be fed to the handshake. */
-+/* TLS session key. A factory-provisioned sensor uses 32 zero bytes; a
-+ * sensor re-provisioned by the Windows driver uses a per-device key, which
-+ * is read from /etc/goodix5117/psk (or $GOODIX_PSK_FILE) when present. */
++/* TLS session key. A factory-provisioned sensor uses 32 zero bytes; a sensor
++ * re-provisioned by the Windows driver carries a per-device key instead.
++ * Neither is related to the 32 bytes returned by Preset PSK Read (0xe4):
++ * those are a digest of the white-box blob and must not be fed to the
++ * handshake. The per-device key is read from /etc/goodix5117/psk (or
++ * $GOODIX_PSK_FILE) when that file is present. */
 +#define GOODIX_TLS_PSK_PATH "/etc/goodix5117/psk"
 +
 +static guint8 goodix_tls_psk[32] = { 0 };

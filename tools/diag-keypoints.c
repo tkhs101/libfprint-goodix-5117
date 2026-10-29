@@ -10,7 +10,7 @@
  *
  * Build (libsigfm.a is C++, so link with g++, not gcc):
  *
- *   g++ -O2 -o diag-keypoints docs/tools/diag-keypoints.c \
+ *   g++ -O2 -o diag-keypoints tools/diag-keypoints.c \
  *       -Ilibfprint -I. \
  *       $(pkg-config --cflags --libs opencv4) \
  *       build/libfprint/sigfm/libsigfm.a -lm
