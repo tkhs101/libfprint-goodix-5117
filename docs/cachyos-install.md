@@ -19,7 +19,7 @@
 | PSK 摘要 | `ba1a8603…d72d43`（出厂值） |
 | 录入 | 20/20 阶段通过 |
 | 验证 | `verify-match` |
-| PAM | `system-auth` 中指纹优先，10 秒超时后回退密码 |
+| PAM | `system-auth` 中指纹优先，最多 3 次、每次 30 秒，失败后回退密码 |
 
 ## 与 Debian / Fedora 的差异
 
@@ -154,20 +154,34 @@ KDE 的锁屏已经自带 `kde-fingerprint` PAM 服务，无需修改；要让 `
 
 ```text
 -auth      [success=3 default=ignore]  pam_systemd_home.so
-auth       [success=2 default=ignore]  pam_fprintd.so       max-tries=1 timeout=10
+auth       [success=2 default=ignore]  pam_fprintd.so       max-tries=3 timeout=30
 auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok
 ```
 
 也就是把 `pam_systemd_home.so` 的 `success` 从 2 改为 3，并在它下面插入
-`pam_fprintd.so`。指纹成功会跳过密码；失败或 10 秒超时后回退到
+`pam_fprintd.so`。指纹成功会跳过密码；3 次都失败或单次 30 秒超时后回退到
 `pam_unix`，所以密码仍然可用。
+
+这里有两个不同层次的“重试”：
+
+- `fprintd` 的一次 `VerifyStart` 只采集一帧。`verify-no-match` 是最终结果，
+  不会在同一帧上反复匹配；只有采集失败（`verify-retry-scan`）才会由
+  fprintd 自动重新开始。
+- `pam_fprintd` 负责在 PAM 层循环调用 `VerifyStart`。`max-tries` 默认是
+  3，`timeout` 默认 30 秒（每一次尝试单独计时）。之前用
+  `max-tries=1 timeout=10` 时，失败一次或 10 秒没按就立即回退密码，
+  看起来就像“只能试一次、必须关掉重来”。
+
+所以 `max-tries=3 timeout=30` 才是可重试的配置；不需要重启 fprintd，
+也不需要拔插传感器。命令行 `fprintd-verify` 本身是单次命令，重跑一次
+就是新的一次尝试。
 
 实测 `sudo` 的行为：
 
 ```text
 请把您的右手食指放在指纹读取器上
 验证超时
-# 10 秒后回退密码，命令成功
+# 单次 30 秒超时后回退密码，命令成功
 ```
 
 > **安全提醒**：指纹优先意味着后台进程也可能触发指纹提示
