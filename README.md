@@ -11,6 +11,10 @@ Also verified on **Fedora 45** with libfprint 1.94.100 / fprintd 1.94.5
 (GCC 16, OpenCV 4.13, GnuTLS 3.8) — see
 [docs/flash-on-linux.md](docs/flash-on-linux.md) for the full recovery log.
 
+Also verified on **CachyOS** (Arch-based) with the same libfprint 1.94.100 /
+fprintd 1.94.5 packages, building the patched library against **OpenCV 5** —
+see [docs/cachyos-install.md](docs/cachyos-install.md).
+
 This repository is an **incremental patch** on top of
 [`gulp/libfprint-1`](https://github.com/gulp/libfprint-1), branch
 `goodix-5117-support`, which already carries the basic 5117 support. Everything
@@ -225,6 +229,14 @@ Fedora notes:
   `~/src/libfprint-1/build/libfprint/libfprint-2.so.2.0.0` into place and run
   `ldconfig`.
 
+### CachyOS / Arch
+
+There is no install script for Arch-based distributions yet; use the manual
+steps in [docs/cachyos-install.md](docs/cachyos-install.md). The important
+differences are the library path (`/usr/lib/libfprint-2.so.2.0.0`), the
+`opencv5.pc` → `opencv4.pc` compatibility shim needed by the current Arch
+`opencv` package, and `glib-mkenums` living in `glib2-devel`.
+
 Then:
 
 ```bash
@@ -356,6 +368,7 @@ for the dump to land anywhere useful.
 | [docs/firmware-extraction.md](docs/firmware-extraction.md) | **Verified** firmware extraction from the right driver package, plus the traps (wrong package, fake "12117"). |
 | [docs/flash-on-linux.md](docs/flash-on-linux.md) | Full recovery log: Linux-only, measured timings, post-flash verification. |
 | [docs/image-quality.md](docs/image-quality.md) | **Measured** keypoint data: why some presses fail, and what local equalisation would buy. |
+| [docs/cachyos-install.md](docs/cachyos-install.md) | CachyOS/Arch install: package names, OpenCV 5 shim, library path, PAM. |
 | [docs/windows-psk-recovery.md](docs/windows-psk-recovery.md) | Windows-only PSK extraction (DPAPI, no flashing). |
 | [docs/psk-recovery.md](docs/psk-recovery.md) | The two PSK layers, the IAP reflash procedure, API audit. |
 | [docs/psk-write-findings.md](docs/psk-write-findings.md) | Exhaustive proof that APP-mode PSK writes are ignored on this family. |
@@ -457,7 +470,9 @@ ninja -C build && sudo ninja -C build install && sudo ldconfig
 sudo systemctl restart fprintd && fprintd-enroll
 ```
 
-Fedora 可直接用 `scripts/install-fedora.sh`（Fedora 44 与 45 均实测通过）。注意：
+Fedora 可直接用 `scripts/install-fedora.sh`（Fedora 44 与 45 均实测通过）。
+CachyOS/Arch 没有安装脚本，手动步骤见
+[docs/cachyos-install.md](docs/cachyos-install.md)（2026-10 实测通过）。注意：
 
 - 驱动选项是 **`goodixtls511`**，`goodixtls` 只是 helper（选中会报
   `Key goodixtls is not in the dictionary`）；
